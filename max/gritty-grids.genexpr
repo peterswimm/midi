@@ -1,0 +1,49 @@
+// ============================================================
+//  Gritty Grids — bytebeat oscillator for Max/MSP gen~
+//  Paste this into a [codebox] inside a [gen~] object.
+//
+//  Morphs between 4 viznut bytebeat one-liners via x/y (bilinear),
+//  exactly like Grids interpolates its stored nodes. Outputs a 1-bit
+//  square (the formula's top bit) or the raw 8-bit waveshape.
+//
+//  DRAFT v1 — authored without a Max instance to test against. The
+//  bytebeat *math* is verified (it's the same as the web demo); what
+//  needs checking in Max is GenExpr's bitwise integer width. If the
+//  timbre sounds wrong, that's the first suspect — see README.
+// ============================================================
+
+Param rate(0.25, min=0.01, max=8);  // t advance per sample = pitch (~0.17 ≈ classic 8kHz bytebeat @48k SR)
+Param x(0.5,    min=0,   max=1);    // map X  (crossfade a<->b, c<->d)
+Param y(0.5,    min=0,   max=1);    // map Y  (crossfade top<->bottom)
+Param bits(1,   min=0,   max=1);    // 1 = 1-bit square (MSB), 0 = 8-bit waveshape
+Param startoff(20000);              // t offset so the programs start lively
+Param level(0.5, min=0,  max=1);
+
+History tph(0);
+
+// advance t and wrap at 2^24 to keep integer precision (still loops nicely)
+step = tph + rate;
+step = step % 16777216;
+tph  = step;
+t = int(step) + int(startoff);
+
+// --- four corner programs (viznut's oneliner collection, 2011) ---
+a = t * (((t>>12) | (t>>8)) & (63 & (t>>4)));   // viznut
+b = (t * ((t>>5) | (t>>8))) >> (t>>16);         // tejeez
+c = t * (42 & (t>>10));                          // "the 42 melody"
+d = (t*5 & (t>>7)) | (t*3 & (t>>10));            // viznut
+
+// low byte -> 0..255
+a = a & 255;  b = b & 255;  c = c & 255;  d = d & 255;
+
+// --- Grids-style bilinear interpolation of the byte values ---
+top = a + (b - a) * x;
+bot = c + (d - c) * x;
+v   = top + (bot - top) * y;
+
+// --- 1-bit square (top bit) OR 8-bit waveshape ---
+sq  = ((int(v) & 128) != 0) ? 1 : -1;
+wv  = v / 127.5 - 1;
+sig = (bits >= 0.5) ? sq : wv;
+
+out1 = sig * level;
