@@ -37,6 +37,30 @@ constexpr int   WT_N          = 256;
 constexpr int   SCOPE_N       = 256;
 constexpr int   MAX_GRAINS    = 24;
 
+constexpr int   KEY_DEF[3]    = {-12, 0, 12};               // free lanes spread an octave
+
+// ── the free-running clock ──
+// A free lane plays the formula itself, so its "pitch" and its "tempo" are
+// the same number: bytebeat has no pitch apart from how fast t advances.
+// Quantising means choosing a rate at which a POWER-OF-TWO block of t lands
+// exactly on a beat, since that is the grid these programs are written to --
+// their bars are 2^12 or 2^13 samples long, which is why they sound like
+// music at 8000 Hz and like noise at 8001.
+//
+// q is picked so the rate sits as close to the native 8000 Hz as a power of
+// two allows, which at 120 BPM is 8192: two beats of 4096. The formula's own
+// bar then lines up with the sequencer's.
+inline double freeBaseRate(int bpm) {
+    const double bps = double(bpm) / 60.0;
+    const double q   = std::floor(std::log2(double(BYTE_RATE) / bps) + 0.5);
+    return std::pow(2.0, q) * bps;
+}
+// Transposing multiplies that rate, so only whole octaves stay on the grid.
+// A semitone is 2^(1/12), which is irrational: the formula's bar drifts
+// against the beat by design, and no amount of code can separate the two
+// without resynthesising the signal, which would be the end of the sound.
+inline bool keyAligned(int semitones) { return semitones % 12 == 0; }
+
 enum class Mode   { Bitseq, Voice };
 enum class Rhythm { Roles, Formula };
 
@@ -145,6 +169,8 @@ struct Params {
     std::atomic<int>  dens[3];                     // density (Bitseq) / pitch (Voice), 0..255
     std::atomic<int>  len[3];                      // track length, 2..16
     std::atomic<int>  atk[3], rel[3], prob[3];     // 0..100
+    std::atomic<int>  freeRun[3];                  // 1 = no sequencer, the formula plays
+    std::atomic<int>  key[3];                      // free lane transpose, semitones
     std::atomic<int>  chaos{30};                   // 0..200
     std::atomic<int>  bpm{120};
     std::atomic<bool> playing{false};
@@ -157,7 +183,13 @@ struct Params {
         for (int i = 0; i < 3; ++i) {
             dens[i] = DENS_DEF[i]; len[i] = LEN_DEF[i];
             atk[i]  = ATK_DEF[i];  rel[i] = REL_DEF[i]; prob[i] = PROB_DEF[i];
+            freeRun[i] = 0; key[i] = KEY_DEF[i];
         }
+    }
+    bool   isFree(int i) const { return freeRun[i].load() != 0; }
+    int    nFree() const { return isFree(0) + isFree(1) + isFree(2); }
+    double freeRate(int i) const {
+        return freeBaseRate(bpm.load()) * std::pow(2.0, key[i].load() / 12.0);
     }
     float envAtk(int i) const { const float u = atk[i] / 100.0f; return 0.001f + u * u * 0.30f; }
     float envRel(int i) const { const float u = rel[i] / 100.0f; return 0.02f  + u * u * 1.50f; }
@@ -250,6 +282,12 @@ private:
     void renderBitseq(float* out, int frames, const Corners& c, Rhythm rhythm,
                       double spStep, float cch, float& peak) {
         const float chaos = float(P.chaos.load());
+        double fInc[3];
+        for (int i = 0; i < 3; ++i) fInc[i] = P.freeRate(i) / double(m_sr);
+        const int   nFree = P.nFree();
+        const int   nSeq  = 3 - nFree;
+        const int   nSrc  = nFree + (nSeq > 0 ? 1 : 0);
+        const float gMix  = 1.0f / float(nSrc > 0 ? nSrc : 1);
         for (int n = 0; n < frames; ++n) {
             if (m_stepClock <= 0) {
                 // Decide the NEXT pulse now and queue its hits one pulse out.
@@ -257,6 +295,7 @@ private:
                 // as late, the way the web demo's scheduler could.
                 const int lp = (m_pulse + (m_warm ? 1 : 0)) % PCYCLE;
                 for (int vi = 0; vi < 3; ++vi) {
+                    if (P.isFree(vi)) continue;         // no sequencer on this lane
                     const float dens = float(P.dens[vi].load());
                     float L;
                     bool  on;
@@ -308,7 +347,14 @@ private:
                 mix += w * env * g.gain;
                 if (++g.n >= g.len) g.active = false;
             }
-            const float s = clip(mix * 0.85f);                       // the demo's master gain
+            float freeMix = 0;
+            for (int i = 0; i < 3; ++i)
+                if (P.isFree(i)) freeMix += freeSample(i, c, fInc[i]);
+
+            const float seq = nSeq > 0 ? clip(mix * 0.85f) : 0.0f;   // the demo's master gain
+            // Linear sum, scaled so it cannot reach full scale: a free lane
+            // must not meet a limiter on its way out.
+            const float s = (seq + freeMix) * gMix;
             out[2 * n] = out[2 * n + 1] = s;
             const float a = std::fabs(s);
             if (a > peak) peak = a;
@@ -326,14 +372,21 @@ private:
         const float grit  = cch * 0.55f;
         double inc[3];
         float  aInc[3], rInc[3];
+        double fInc[3];
         for (int i = 0; i < 3; ++i) {
             inc[i]  = double(P.voiceRate(i)) * double(BYTE_RATE) / double(m_sr);
+            fInc[i] = P.freeRate(i) / double(m_sr);
             aInc[i] = 1.0f / (P.envAtk(i) * float(m_sr));
             rInc[i] = 1.0f / (P.envRel(i) * float(m_sr));
         }
+        const int   nFree = P.nFree();
+        const int   nSeq  = 3 - nFree;
+        const int   nSrc  = nFree + (nSeq > 0 ? 1 : 0);
+        const float gMix  = 1.0f / float(nSrc > 0 ? nSrc : 1);
         for (int n = 0; n < frames; ++n) {
             if (m_stepClock <= 0) {                 // pulse boundary -> retrigger
                 for (int i = 0; i < 3; ++i) {
+                    if (P.isFree(i)) continue;          // no sequencer on this lane
                     bool hit;
                     if (rhythm == Rhythm::Formula) {
                         const int Ln = P.laneLen(i);
@@ -357,8 +410,9 @@ private:
             }
             m_stepClock -= 1.0;
 
-            float mix = 0;
+            float mix = 0, freeMix = 0;
             for (int i = 0; i < 3; ++i) {
+                if (P.isFree(i)) { freeMix += freeSample(i, c, fInc[i]); continue; }
                 if (m_rCount[i] > 0) {                               // ratchet / roll
                     if (m_rClock[i] <= 0) {
                         m_stage[i] = 1;
@@ -387,17 +441,52 @@ private:
                     M.scopePtr[i].store((p + 1) & (SCOPE_N - 1), std::memory_order_relaxed);
                 }
             }
-            const float s = mix * 0.5f;
-            m_lp += 0.6f * (s - m_lp);                               // tames 1-bit aliasing
-            const float dc = m_lp - m_dcX + 0.995f * m_dcY;          // centre the duty cycle
-            m_dcX = m_lp;
-            m_dcY = dc;
-            const float o = clip(dc);
+            float seq = 0;
+            if (nSeq > 0) {
+                const float s = mix * 0.5f;
+                m_lp += 0.6f * (s - m_lp);                           // tames 1-bit aliasing
+                const float dc = m_lp - m_dcX + 0.995f * m_dcY;      // centre the duty cycle
+                m_dcX = m_lp;
+                m_dcY = dc;
+                seq = clip(dc);
+            }
+            // Linear sum, scaled so it cannot reach full scale: a free lane
+            // must not meet a limiter on its way out.
+            const float o = (seq + freeMix) * gMix;
             out[2 * n] = out[2 * n + 1] = o;
             const float a = std::fabs(o);
             if (a > peak) peak = a;
             ++m_samples;
         }
+    }
+
+    // ── a free lane, with nothing done to it ──
+    // This is the one path in the engine that must not be improved. No
+    // envelope, no gate, no grain, no low-pass, no DC blocker, no clip, no
+    // grit: the byte comes out of the formula and goes to the speaker. The
+    // only thing between them is the zero-order hold that carries 8000 Hz to
+    // the device rate, which is what a bytebeat has always been played
+    // through and is where its aliasing character comes from -- interpolating
+    // there would smooth off the sound rather than preserve it.
+    //
+    // The one liberty is the blend: between nodes this is a weighted average
+    // of four programs' bytes, which is a signal none of them is. Standing on
+    // a node, the weights are 1 and 0 and you are hearing that one-liner
+    // exactly.
+    float freeSample(int i, const Corners& c, double inc) {
+        m_vAcc[i] += inc;
+        const int64_t ti = int64_t(std::floor(m_vAcc[i]));
+        if (ti != m_vTi[i]) {
+            m_vTi[i] = ti;
+            float v = 0;
+            for (int k = 0; k < 4; ++k) v += c.w[k] * float(sample(c.idx[k], ti));
+            m_vVal[i] = v;
+        }
+        const float smp = (m_vVal[i] - 127.5f) * (1.0f / 127.5f);
+        const int p = M.scopePtr[i].load(std::memory_order_relaxed);
+        M.scope[i][p] = smp;
+        M.scopePtr[i].store((p + 1) & (SCOPE_N - 1), std::memory_order_relaxed);
+        return smp;
     }
 
     void publishPulse() {

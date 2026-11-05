@@ -45,6 +45,9 @@ on screen as you move over it. Everything downstream is derived from the blend:
 - **Per-voice A / R**, **P** (trigger probability, which ratchets into exponential rolls
   past three quarters), and a **Chaos** knob that mutates pattern, timing and per-hit
   timbre at once.
+- **Free lanes** — a lane can switch its sequencer off entirely and let the formula play
+  its own music, clocked to the tempo and transposed by semitones. See
+  *[A lane with no sequencer](#a-lane-with-no-sequencer)* below.
 
 Nothing is sampled. Every sound on screen is arithmetic on a counter.
 
@@ -62,6 +65,8 @@ The puck is the instrument; everything else is a modifier.
 | **B** | engine: Bitseq / Bit voice |
 | **X** | rhythm source: Roles / Formula |
 | **Y** | jump to the next lane's controls |
+| **F** (per lane) | sequencer off: the formula plays itself |
+| **K** (per lane) | transpose a free lane, in semitones |
 | **L1 / R1** | pick a control |
 | **L2 / R2** | change it — hold to repeat, and it coarsens the longer you hold |
 | **SELECT** | back to the defaults, and clear the destinations |
@@ -90,13 +95,60 @@ they answer to, amber for the one being travelled to; the HUD shows how far alon
 morph is. The pip is drawn geometry rather than an `↑`, because Open Sans has no arrow
 glyphs at this size — worth knowing before anyone simplifies it back to a character.
 
+### A lane with no sequencer
+
+![A lane with no sequencer](docs/free-lanes.png)
+
+*FOUR and EIGHTHS are free, an octave apart; BACKBEAT is still sequenced. The traces on
+the right are the formulas' actual waveforms, not 1-bit squares.*
+
+These one-liners are not oscillators — they are **music**, with their own drums, basslines
+and phrasing, which is why viznut's collection is worth listening to rather than merely
+hearing. Everything else in this app treats them as raw material: Bitseq chops a formula
+into 256-sample wavetables and rebuilds it as a drum, Bit voice takes one bit of it and
+gates the square with an envelope. Both are the sequencer talking over the tune.
+
+Set a lane's **F** control to FREE and it stops: no gate, no envelope, no grain, no
+probability, no ratchet. That lane's output is the formula itself.
+
+**Nothing is done to the signal on the way out.** No low-pass, no DC blocker, no clip, no
+grit, no dither — the byte leaves `bytebeat.h` and arrives at the device. The only thing
+in the path is the zero-order hold that carries 8000 Hz up to the device rate, which is
+what a bytebeat has always been played through and is where its aliasing character comes
+from; interpolating there would smooth the sound off rather than preserve it. A sample at
+full scale is a byte of 255, not a limiter engaging, because there is no limiter.
+`test_free` renders real audio through the real engine and compares it with the formulas
+computed directly, sample for sample — add a filter to that path and the test fails.
+
+#### Quantised tempo and key
+
+A free lane's pitch and its tempo are the same number, because a bytebeat has no pitch
+apart from how fast `t` advances. Quantising means picking a rate at which a
+**power-of-two block of `t` lands exactly on a beat** — that is the grid these programs
+are written to, their bars being 2^12 or 2^13 samples long, which is why they sound like
+music at 8000 Hz and like noise at 8001. The rate chosen is the power of two closest to
+the native 8000: at 120 BPM that is 8192, so **4096 samples a beat**, and the formula's
+own bar lines up with the sequencer's.
+
+**K** transposes in semitones, which multiplies that rate — so only whole octaves stay on
+the grid. A semitone is 2^(1/12), an irrational ratio, so the formula's bar drifts against
+the beat on purpose. Nothing can separate the two without resynthesising the signal, which
+would be the end of the sound design, so the app does not pretend otherwise: a key that is
+not a whole octave reads `*` on the strip and *off the grid* on the lane.
+
+The one liberty taken is the blend. Between nodes a free lane plays a weighted average of
+four programs' bytes, which is a signal none of them is. Standing on a node, the weights
+are 1 and 0 and you are hearing that one-liner exactly.
+
 ### Reaching the rest of the controls
 
-Only BPM, Chaos and the focused lane's five are on the strip at once. **L1 / R1** walk the
+Only BPM, Chaos and the focused lane's live controls are on the strip at once. **L1 / R1** walk the
 whole list, crossing into the next lane when they run out; **Y** jumps straight to the
 next lane. A control the current mode has no use for is skipped rather than shown dead:
-**L** (track length) only exists in Formula, **P** only in Bit voice. **D** is density in
-Bitseq and pitch in Bit voice, and reads out in the right units for each.
+**L** (track length) only exists in Formula, **P** only in Bit voice, and **K** only on a
+free lane. **D** is density in Bitseq and pitch in Bit voice, and reads out in the right
+units for each. A free lane has no sequencer and no envelope, so D, L, A, R and P are not
+dimmed there — they are gone, and only **F** and **K** remain.
 
 On a desktop the keyboard is a full pad (sndstation's own fallback): arrows for the
 D-pad, **Z** and **X** for A and B, **C** and **V** for X and Y, **1**/**4** for L1/R1,
@@ -146,9 +198,14 @@ what to do about it, rather than at link time.
 ```
 
 ```
-bitseq       48.3 ms for 20.0 s audio =  0.24% of one core   peak 1.00  rms 0.090  clipped 0.001%
-bit-voice    63.4 ms for 20.0 s audio =  0.32% of one core   peak 1.00  rms 0.194  clipped 0.194%
+bitseq       49.7 ms for 20.0 s audio =  0.25% of one core   peak 1.00  rms 0.090  at full scale 0.001%
+bit-voice    71.3 ms for 20.0 s audio =  0.36% of one core   peak 1.00  rms 0.193  at full scale 0.194%
+free x3      70.1 ms for 20.0 s audio =  0.35% of one core   peak 1.00  rms 0.403  at full scale 0.288%
 ```
+
+"At full scale" is `|x| >= 0.999`. For the two sequenced engines that is the clipper
+engaging. For free lanes there is no clipper: a byte of 255 is exactly +1.0, so those
+samples are the formula's own range arriving intact.
 
 (An Apple M-series desktop. An RK3326 is roughly an order of magnitude slower per core,
 which still leaves both engines comfortably inside one audio thread — but that number
@@ -190,6 +247,7 @@ ctest --test-dir build
 
 ```
 test_bytebeat: 25 nodes, 809325 samples, bit-exact with the web demo
+test_free: 4096 samples bit-exact with the formula, 4096 (2^12) per beat, rms 0.384
 ```
 
 A change to [`bytebeat.h`](bytebeat.h) that alters one byte anywhere in that range fails
@@ -232,4 +290,5 @@ ladder, the kick's pitch drop and the 1-bit grit are all the demo's own numbers.
 | [`engine.h`](engine.h) | the map, the blend, both engines, as one render callback |
 | [`main.cpp`](main.cpp) | the screen, the pad, the controls, `--shots` and `--bench` |
 | [`test_bytebeat.cpp`](test_bytebeat.cpp) | the golden values and the dense-sweep hash |
+| [`test_free.cpp`](test_free.cpp) | proof that nothing processes a free lane |
 | [`gritty-grids.json`](gritty-grids.json) | the launcher's manifest |

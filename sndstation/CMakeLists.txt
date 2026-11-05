@@ -31,5 +31,10 @@ target_compile_options(gritty-grids PRIVATE -Wall -Wextra)
 # The bytebeat nodes, checked against the web demo's own numbers.
 add_executable(test_bytebeat test_bytebeat.cpp)
 target_compile_options(test_bytebeat PRIVATE -Wall -Wextra)
+# The free lane must reach the speaker unprocessed.
+add_executable(test_free test_free.cpp)
+target_compile_options(test_free PRIVATE -Wall -Wextra)
+
 enable_testing()
 add_test(NAME bytebeat COMMAND test_bytebeat)
+add_test(NAME free COMMAND test_free)

@@ -102,7 +102,7 @@ struct Ctl {
     int               lo, hi, step;
 };
 
-Ctl  g_ctl[2 + 3 * 5];
+Ctl  g_ctl[2 + 3 * 7];
 int  g_nCtl = 0;
 int  g_cursor = 0;
 
@@ -111,6 +111,8 @@ void buildControls() {
     g_ctl[g_nCtl++] = {"BPM",   -1, &g_params.bpm,   40, 240, 1};
     g_ctl[g_nCtl++] = {"CHAOS", -1, &g_params.chaos,  0, 200, 2};
     for (int i = 0; i < 3; ++i) {
+        g_ctl[g_nCtl++] = {"F", i, &g_params.freeRun[i], 0,   1, 1};
+        g_ctl[g_nCtl++] = {"K", i, &g_params.key[i],   -24,  24, 1};
         g_ctl[g_nCtl++] = {"D", i, &g_params.dens[i], 0, 255, 2};
         g_ctl[g_nCtl++] = {"L", i, &g_params.len[i],  2,  16, 1};
         g_ctl[g_nCtl++] = {"A", i, &g_params.atk[i],  0, 100, 1};
@@ -121,6 +123,11 @@ void buildControls() {
 // A control the current mode has no use for is skipped by the cursor, the way
 // the demo hides L outside Formula and P outside Bit voice.
 bool ctlLive(const Ctl& c) {
+    // A free lane has no sequencer and no envelope, so the five controls that
+    // drive them are not dimmed, they are gone: only F and its key remain.
+    if (c.lane >= 0 && g_params.isFree(c.lane))
+        return c.label[0] == 'F' || c.label[0] == 'K';
+    if (c.label[0] == 'K') return false;
     if (c.label[0] == 'L' && c.label[1] == 0)
         return Rhythm(g_params.rhythm.load()) == Rhythm::Formula;
     if (c.label[0] == 'P' && c.label[1] == 0)
@@ -152,6 +159,12 @@ std::string ctlValue(const Ctl& c) {
         return buf;
     }
     switch (c.label[0]) {
+        case 'F': return v ? "FREE" : "SEQ";
+        case 'K': {
+            const char* mark = keyAligned(v) ? "" : "*";   // * = off the beat grid
+            std::snprintf(buf, sizeof buf, "%+d%s", v, mark);
+            return buf;
+        }
         case 'D':
             if (Mode(g_params.mode.load()) == Mode::Voice)
                 std::snprintf(buf, sizeof buf, "\xC3\x97%.2f", g_params.voiceRate(i));
@@ -431,7 +444,9 @@ void drawLanes(SDL_Renderer* r, int bx, int by, int w, float dt) {
         const int y = by + vi * rowH;
         gfx::textMid(r, Font::Label, laneName(vi), bx, y + su(9),
                      g_ctl[g_cursor].lane == vi ? P.phos : P.txt1);
-        gfx::textMid(r, Font::Small, laneRole(vi, mode), bx, y + su(21), P.txt2);
+        const bool freeLane = g_params.isFree(vi);
+        gfx::textMid(r, Font::Small, freeLane ? "no sequencer" : laneRole(vi, mode),
+                     bx, y + su(21), freeLane ? P.amber : P.txt2);
 
         const int Ln   = g_params.laneLen(vi);
         const float dens = float(g_params.dens[vi].load());
@@ -458,7 +473,24 @@ void drawLanes(SDL_Renderer* r, int bx, int by, int w, float dt) {
         if (g_flash[vi].t > 0) g_flash[vi].t -= dt;
 
         const int ph = running ? g_meters.step[vi].load() : -1;
-        for (int s = 0; s < Ln; ++s) {
+        // A free lane has no steps to show. Saying so is more honest than
+        // leaving a grid up that nothing is reading.
+        if (freeLane) {
+            const SDL_Rect band{cellsX, y + su(4), cellsW, su(18)};
+            gfx::fillRect(r, band, P.bg2);
+            gfx::frameRect(r, band, P.line);
+            const int    kv  = g_params.key[vi].load();
+            const double br  = freeBaseRate(g_params.bpm.load());
+            const double per = br / (double(g_params.bpm.load()) / 60.0);
+            char caption[72];
+            std::snprintf(caption, sizeof caption,
+                          "the formula is playing itself \xC2\xB7 %d per beat \xC2\xB7 %+d st%s",
+                          int(std::lround(per)), kv,
+                          keyAligned(kv) ? "" : " \xC2\xB7 off the grid");
+            gfx::textMid(r, Font::Small, caption, cellsX + cellsW / 2, y + su(13),
+                         P.txt2, 0);
+        }
+        for (int s = 0; !freeLane && s < Ln; ++s) {
             const SDL_Rect cell{cellsX + s * cw, y + su(4), cw - su(2), su(18)};
             float L;
             bool  on;
@@ -480,16 +512,23 @@ void drawLanes(SDL_Renderer* r, int bx, int by, int w, float dt) {
             gfx::frameRect(r, cell, s == ph ? P.phos : P.line);
         }
 
-        // Bit voice: the lane's own 1-bit trace, to the right of its steps.
-        if (mode == Mode::Voice) {
+        // The lane's own trace: 1-bit in Bit voice, the formula's actual
+        // waveform when the lane is free. Mapped linearly either way, so a
+        // square still reads as two rails and a free lane reads as itself.
+        if (mode == Mode::Voice || freeLane) {
             const int sx = cellsX + cellsW + su(8), sw = su(80), sh = su(18);
+            const int mid = y + su(4) + sh / 2;
             gfx::fillRect(r, {sx, y + su(4), sw, sh}, P.screen);
             const int start = g_meters.scopePtr[vi].load();
             for (int j = 0; j < sw; ++j) {
                 const int   si = (start + j * SCOPE_N / sw) & (SCOPE_N - 1);
-                const float v  = g_meters.scope[vi][si];
-                const int   yy = y + su(4) + int(v > 0 ? sh * 0.26f : sh * 0.74f);
-                gfx::fillRect(r, {sx + j, yy, 1, su(2)}, P.phos);
+                float       v  = g_meters.scope[vi][si];
+                if (v < -1) v = -1;
+                if (v >  1) v =  1;
+                int yy = mid - int(v * (sh * 0.42f));
+                if (yy < y + su(4)) yy = y + su(4);
+                if (yy > y + su(4) + sh - su(2)) yy = y + su(4) + sh - su(2);
+                gfx::fillRect(r, {sx + j, yy, 1, su(2)}, freeLane ? P.amber : P.phos);
             }
             gfx::frameRect(r, {sx, y + su(4), sw, sh}, P.line);
         }
@@ -603,14 +642,22 @@ int bench(double seconds) {
     static float buf[block * 2];
     const long blocks = long(seconds * sr / block);
     int worst = 0;
-    for (int mode = 0; mode < 2; ++mode) {
-        g_params.mode.store(mode);
+    // the third pass is all three lanes free: a different code path, and the
+    // one with no envelopes, no grains and no filters in it
+    for (int mode = 0; mode < 3; ++mode) {
+        g_params.mode.store(mode == 2 ? int(Mode::Bitseq) : mode);
+        for (int i = 0; i < 3; ++i) g_params.freeRun[i].store(mode == 2 ? 1 : 0);
         g_params.playing.store(true);
         g_engine.rewind();
         const auto t0 = std::chrono::steady_clock::now();
         double peak = 0, sumSq = 0;
         long   clipped = 0, total = 0;
         for (long b = 0; b < blocks; ++b) {
+            // "at full scale" means |x| >= 0.999. For bitseq and bit-voice that
+            // is the clipper engaging. For free lanes there is no clipper: a
+            // byte of 255 is exactly +1.0, so those samples are the formula's
+            // own range arriving intact, which is the point of the mode.
+            //
             // sweep the puck across the whole map while it runs: the worst
             // case is a moving position, which rebuilds a wavetable per hit.
             g_params.x.store(int(255.0 * double(b) / double(blocks)));
@@ -629,13 +676,15 @@ int bench(double seconds) {
                               std::chrono::steady_clock::now() - t0).count();
         const double realtime = seconds * 1000.0;
         std::printf("%-10s %6.1f ms for %.1f s audio = %5.2f%% of one core   "
-                    "peak %.2f  rms %.3f  clipped %.3f%%\n",
-                    mode ? "bit-voice" : "bitseq", ms, seconds, ms / realtime * 100.0,
+                    "peak %.2f  rms %.3f  at full scale %.3f%%\n",
+                    mode == 2 ? "free x3" : (mode ? "bit-voice" : "bitseq"),
+                    ms, seconds, ms / realtime * 100.0,
                     peak, std::sqrt(sumSq / double(total)),
                     double(clipped) / double(total) * 100.0);
         if (peak < 0.01) { std::printf("  silent: that is a bug\n"); worst = 1; }
     }
     g_params.playing.store(false);
+    for (int i = 0; i < 3; ++i) g_params.freeRun[i].store(0);
     return worst;
 }
 
@@ -678,12 +727,14 @@ int main(int argc, char** argv) {
         // layout can be reviewed with no handheld and no display.
         // dests: bind a few waypoints so the shot shows the markers, one of
         // them mid-travel (amber) and the rest idle.
-        struct Shot { const char* name; Mode m; Rhythm r; bool run; int cursor; bool dests; };
+        struct Shot { const char* name; Mode m; Rhythm r; bool run; int cursor;
+                      bool dests; int freeMask; };
         const Shot shots_[] = {
-            {"bitseq-roles",    Mode::Bitseq, Rhythm::Roles,   false, 0,  false},
-            {"bitseq-formula",  Mode::Bitseq, Rhythm::Formula, true,  3,  true},
-            {"voice-roles",     Mode::Voice,  Rhythm::Roles,   true,  6,  false},
-            {"voice-formula",   Mode::Voice,  Rhythm::Formula, true,  11, false},
+            {"bitseq-roles",    Mode::Bitseq, Rhythm::Roles,   false, 0,  false, 0},
+            {"bitseq-formula",  Mode::Bitseq, Rhythm::Formula, true,  3,  true,  0},
+            {"voice-roles",     Mode::Voice,  Rhythm::Roles,   true,  6,  false, 0},
+            {"voice-formula",   Mode::Voice,  Rhythm::Formula, true,  11, false, 0},
+            {"free-lanes",      Mode::Bitseq, Rhythm::Formula, true,  2,  false, 0b101},
         };
         int bad = 0;
         for (const Shot& s : shots_) {
@@ -692,6 +743,10 @@ int main(int argc, char** argv) {
             g_params.playing.store(s.run);
             g_params.x.store(s.run ? 196 : 128);
             g_params.y.store(s.run ? 72  : 128);
+            for (int i = 0; i < 3; ++i) {
+                g_params.freeRun[i].store((s.freeMask >> i) & 1);
+                g_params.key[i].store(KEY_DEF[i]);
+            }
             g_cursor = s.cursor;
             clearDests();
             if (s.dests) {
