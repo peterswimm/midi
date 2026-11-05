@@ -41,8 +41,8 @@ int main() {
         for (int b = 0; b < 4; ++b)
             for (int i = 0; i < 64; ++i) {
                 const double t = double(BASES[b] + i);
-                if (mode == MODE_FLOAT) std::snprintf(n, sizeof n, "%.12g", double(exprByte(e, mode, t)));
-                else                    std::snprintf(n, sizeof n, "%d", int(exprByte(e, mode, t)));
+                if (mode == MODE_FLOAT) std::snprintf(n, sizeof n, "%.12g", exprValue(e, mode, t));
+                else                    std::snprintf(n, sizeof n, "%d", int(exprValue(e, mode, t)));
                 if (!out.empty()) out += ',';
                 out += n;
             }

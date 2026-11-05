@@ -86,15 +86,42 @@ int main() {
     same("(t=8,t/=4,t)",      2);
     check(std::isnan(ev("(q+1)")), "a variable read before it is written is NaN");
 
+    // `random()` is reproducible: the same sample index gives the same noise
+    // every pass, which is what lets it be verified at all. The values below
+    // are what node produces under the same hash (tools/verify-expr.mjs).
+    {
+        Expr r;
+        check(r.compile("random()*255"), "random compiles");
+        check(int(exprByte(r, MODE_BYTE, 1)) == 80 &&
+              int(exprByte(r, MODE_BYTE, 2)) == 48 &&
+              int(exprByte(r, MODE_BYTE, 3)) == 133, "random matches javascript");
+        check(exprByte(r, MODE_BYTE, 7) == exprByte(r, MODE_BYTE, 7),
+              "random is the same on a second pass");
+        // two calls in one sample are different draws, not the same one
+        Expr r2;
+        check(r2.compile("random()-random()"), "two draws compile");
+        check(r2.eval(5) != 0.0, "two draws in a sample differ");
+    }
+
+    // arrow functions, which is how a song carries a voice it plays at
+    // several pitches
+    same("(f=x=>x*2, f(21))",               42);
+    same("(f=(a,b)=>a+b, f(3,4))",          7);
+    same("(f=(a,b=10)=>a+b, f(3))",         13);
+    same("(f=(a,b=a*2)=>a+b, f(3))",        9);     // a default sees the earlier arg
+    same("(x=5, f=x=>x*3, f(2)+x)",         11);    // the parameter does not leak
+    same("(f=x=>x+1, g=y=>f(y)*2, g(4))",   10);    // nested calls
+
     // what must be refused rather than guessed at
     Expr e;
-    check(!e.compile("Math.random()*5"), "random is refused");
     check(!e.compile("[1,2]"),           "an un-indexed table is refused");
     check(!e.compile("t; t"),            "a statement is refused");
     check(!e.compile("window.foo"),      "a host object is refused");
+    check(!e.compile("f=x=>{return 1}"),  "a statement body is refused");
+    check(!e.compile("Array(8).fill(0)"), "a host call is refused");
 
     if (fails) return 1;
     std::printf("test_expr: 25 formulas agree with the hand port over 300000 ticks, "
-                "and 28 coercions match JavaScript\n");
+                "and 40 coercions, draws and calls match JavaScript\n");
     return 0;
 }

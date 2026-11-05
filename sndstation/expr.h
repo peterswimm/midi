@@ -67,7 +67,7 @@ enum : uint8_t {
     OP_LT, OP_GT, OP_LE, OP_GE, OP_EQ, OP_NE,
     OP_LAND, OP_LOR, OP_COMMA, OP_COND,
     OP_TABLE,
-    OP_VAR, OP_ASSIGN,
+    OP_VAR, OP_ASSIGN, OP_RAND, OP_CALL,
     OP_F1, OP_F2, OP_FN
 };
 // the one-argument Math functions, indexed by Expr::Node::fi
@@ -79,14 +79,38 @@ enum : uint8_t {
 enum : uint8_t { F2_POW, F2_ATAN2 };
 enum : uint8_t { FN_MIN, FN_MAX, FN_HYPOT };
 
+// ── `random()`, made reproducible ──
+//
+// The archive leans on `random()` for noise -- snare tails, dust, dither --
+// and refusing it costs eighty-odd songs. But true randomness would make a
+// song sound different on every pass, which breaks the determinism the blend
+// rests on (the same map position must sound the same every time) and makes
+// verification against node impossible.
+//
+// So `random()` here is a hash of the sample index and the call number: white
+// noise with the same distribution, drawn fresh at every tick, and identical
+// on every pass and in both evaluators. The song gets the noise it asked for
+// and we can still prove we are playing it right. This is a deliberate
+// divergence from the composer, and the only one in the language.
+inline double jsRandom(uint32_t t0, uint32_t& rc) {
+    uint32_t h = t0 ^ (rc++ * 0x9E3779B1u);
+    h = (h ^ (h >> 16)) * 0x85EBCA6Bu;
+    h = (h ^ (h >> 13)) * 0xC2B2AE35u;
+    h =  h ^ (h >> 16);
+    return double(h) / 4294967296.0;
+}
+
 class Expr {
 public:
     static constexpr int MAX_NODES = 1024;
-    static constexpr int MAX_CONST = 1024;
+    static constexpr int MAX_ELEM  = 2048;   // table elements, across one song
     static constexpr int MAX_ARGS  = 8;
     static constexpr int MAX_DEPTH = 160;
     // Slot 0 is `t`, which a song may assign to (`t/=4` is a common opening).
-    static constexpr int MAX_SLOTS = 48;
+    static constexpr int MAX_SLOTS = 64;
+    static constexpr int MAX_FUNCS = 16;     // arrow functions in one song
+    static constexpr int MAX_PARAM = 6;
+    static constexpr int MAX_CALLD = 24;     // nested calls, so recursion ends
 
     struct Node {
         uint8_t op = OP_K;
@@ -104,6 +128,8 @@ public:
     // and the expression must not be evaluated.
     bool compile(const char* src) {
         m_src = src; m_p = src; m_nn = 0; m_nk = 0; m_depth = 0; m_nslot = 1;
+        m_nf = 0;
+        for (int i = 0; i < MAX_SLOTS; ++i) m_fnOf[i] = -1;
         std::memset(m_slotName, 0, sizeof m_slotName);
         std::snprintf(m_slotName[0], sizeof m_slotName[0], "t");
         m_err[0] = 0;
@@ -123,22 +149,42 @@ public:
         return true;
     }
 
+    struct Frame {
+        double   v[MAX_SLOTS];
+        uint32_t t0 = 0;      // the sample index, for random()
+        uint32_t rc = 0;      // how many random() calls so far this sample
+        int      cd = 0;      // call depth, so a recursive song cannot run away
+    };
+
     double eval(double t) const {
         // The frame lives on the caller's stack, so one compiled song can be
         // played by three lanes at once without them sharing variables.
-        double slot[MAX_SLOTS];
-        slot[0] = t;
-        for (int i = 1; i < MAX_SLOTS; ++i) slot[i] = std::nan("");
-        return ev(m_root, slot);
+        Frame f;
+        f.v[0] = t;
+        for (int i = 1; i < MAX_SLOTS; ++i) f.v[i] = std::nan("");
+        f.t0 = uint32_t(jsToInt32(t));
+        return ev(m_root, f);
     }
 
     const char* error() const { return m_err; }
     int         nodes() const { return m_nn; }
 
 private:
-    Node   m_pool[MAX_NODES];
-    double m_kpool[MAX_CONST];
-    int    m_nn = 0, m_nk = 0, m_root = -1, m_depth = 0;
+    Node    m_pool[MAX_NODES];
+    int32_t m_elem[MAX_ELEM];       // one node id per table element, -1 = a hole
+    int     m_nn = 0, m_nk = 0, m_root = -1, m_depth = 0;
+    // An arrow function. Parameters live in ordinary frame slots, saved and
+    // restored around each call, which costs nothing and makes nesting --
+    // and recursion, up to a limit -- behave.
+    struct Func {
+        int nparam = 0;
+        int slot[MAX_PARAM]{};
+        int dflt[MAX_PARAM]{};    // a default expression, or -1
+        int body = -1;
+    };
+    Func   m_func[MAX_FUNCS];
+    int    m_nf = 0;
+    int    m_fnOf[MAX_SLOTS]{};   // which function a name holds, -1 for none
     char   m_slotName[MAX_SLOTS][12]{};
     int    m_nslot = 1;                 // slot 0 is `t`
     const char* m_src = nullptr;
@@ -190,6 +236,21 @@ private:
                 uint8_t cop; int clen;
                 if (assignOp(cop, clen)) {
                     m_p += clen;
+                    // `f = x => expr` and `f = (a, b = 2) => expr` define a
+                    // function rather than compute a value. Songs use them
+                    // for a voice or an envelope they then call at several
+                    // pitches, which is most of what is left in the archive.
+                    if (cop == 0xFF) {
+                        const int fi = tryArrow();
+                        if (fi == -2) return -1;
+                        if (fi >= 0) {
+                            m_fnOf[slotOf(cond)] = fi;
+                            const int nd2 = alloc(OP_K);
+                            if (nd2 < 0) return -1;
+                            m_pool[nd2].k = std::nan("");   // its numeric value
+                            return nd2;
+                        }
+                    }
                     const int rhs = parseExpr(1);
                     if (rhs < 0) return -1;
                     int val = rhs;
@@ -237,6 +298,85 @@ private:
             lhs = nd;
             if (op == OP_EXP) return lhs;
         }
+    }
+
+    // Is an arrow function next? Returns its index, -1 if not one, -2 on a
+    // definite error. Needs lookahead, because `(a, b)` is a parenthesised
+    // expression until the `=>` after it says otherwise.
+    int tryArrow() {
+        const char* save = m_p;
+        skip();
+        const char* start = m_p;
+        char names[MAX_PARAM][12];
+        int  np = 0;
+        bool paren = false;
+        if (*m_p == '(') {
+            paren = true;
+            int d = 0; const char* q = m_p;
+            for (; *q; ++q) { if (*q == '(') ++d; else if (*q == ')') { if (--d == 0) { ++q; break; } } }
+            const char* r = q; while (*r == ' ') ++r;
+            if (!(r[0] == '=' && r[1] == '>')) { m_p = save; return -1; }
+            ++m_p;
+        } else if (isIdent(*m_p) && !(*m_p >= '0' && *m_p <= '9')) {
+            const char* q = m_p; while (isIdent(*q)) ++q;
+            const char* r = q; while (*r == ' ') ++r;
+            if (!(r[0] == '=' && r[1] == '>')) { m_p = save; return -1; }
+        } else { m_p = save; return -1; }
+        (void)start;
+
+        if (m_nf >= MAX_FUNCS) { fail("too many functions"); return -2; }
+        Func& fn = m_func[m_nf];
+        fn = Func{};
+        for (int i = 0; i < MAX_PARAM; ++i) fn.dflt[i] = -1;
+
+        // the parameter list
+        for (;;) {
+            skip();
+            if (paren && *m_p == ')') { ++m_p; break; }
+            if (!isIdent(*m_p)) { fail("bad parameter"); return -2; }
+            const char* b = m_p; while (isIdent(*m_p)) ++m_p;
+            const int ln = int(m_p - b);
+            if (np >= MAX_PARAM) { fail("too many parameters"); return -2; }
+            if (ln >= int(sizeof names[0])) { fail("parameter name too long"); return -2; }
+            std::memcpy(names[np], b, size_t(ln)); names[np][ln] = 0;
+            ++np;
+            skip();
+            if (*m_p == '=' && m_p[1] != '>' && m_p[1] != '=') {   // a default
+                ++m_p;
+                const int d = parseExpr(1);
+                if (d < 0) return -2;
+                fn.dflt[np - 1] = d;
+                skip();
+            }
+            if (paren && *m_p == ',') { ++m_p; continue; }
+            if (paren && *m_p == ')') { ++m_p; break; }
+            if (!paren) break;
+            fail("bad parameter list"); return -2;
+        }
+        skip();
+        if (!(m_p[0] == '=' && m_p[1] == '>')) { fail("expected '=>'"); return -2; }
+        m_p += 2;
+        skip();
+        if (*m_p == '{') { fail("a function body must be an expression"); return -2; }
+
+        // Parameters get slots of their own, named so a body referring to an
+        // outer variable of the same name finds the parameter, as it should.
+        fn.nparam = np;
+        for (int i = 0; i < np; ++i) {
+            int sl = -1;
+            for (int k = 0; k < m_nslot; ++k)
+                if (std::strcmp(m_slotName[k], names[i]) == 0) { sl = k; break; }
+            if (sl < 0) {
+                if (m_nslot >= MAX_SLOTS) { fail("too many variables"); return -2; }
+                sl = m_nslot++;
+                std::snprintf(m_slotName[sl], sizeof m_slotName[sl], "%s", names[i]);
+            }
+            fn.slot[i] = sl;
+        }
+        const int fi = m_nf++;              // claim it before the body, for recursion
+        fn.body = parseExpr(1);
+        if (fn.body < 0) return -2;
+        return fi;
     }
 
     int slotOf(int node) const { return m_pool[node].op == OP_T ? 0 : m_pool[node].slot; }
@@ -335,11 +475,11 @@ private:
                 // it wrong is not a corner case; it transposes the tune.
                 if (m_pool[lhs].str)
                     for (int j = 0; j < m_pool[lhs].tn; ++j) {
-                        const char ch2 = char(int(m_kpool[m_pool[lhs].ti + j]));
-                        m_kpool[m_pool[lhs].ti + j] =
-                            (ch2 >= '0' && ch2 <= '9') ? double(ch2 - '0')
-                          : (ch2 == ' ') ? 0.0           // Number(" ") is 0
-                          : std::nan("");                // Number("a") is NaN
+                        Node& kn = m_pool[m_elem[m_pool[lhs].ti + j]];
+                        const char ch2 = char(int(kn.k));
+                        kn.k = (ch2 >= '0' && ch2 <= '9') ? double(ch2 - '0')
+                             : (ch2 == ' ') ? 0.0           // Number(" ") is 0
+                             : std::nan("");                // Number("a") is NaN
                     }
                 ++m_p;
                 const int idx = parseExpr(0);
@@ -411,25 +551,33 @@ private:
         return nd;
     }
 
-    // `[a,b,c]` — a constant lookup table. Non-constant elements are rejected
-    // rather than evaluated, because a table is read once at compile time.
+    // `[a, b, c]` — a lookup table. Elements are full expressions, not just
+    // numbers: a song is as likely to write `[t>>13&5, 7-(t>>13&5), 7]` as a
+    // list of constants, and only the element actually selected is evaluated.
+    // A hole (`[0,2,,5]`) is `undefined`, so NaN, exactly as in JavaScript; a
+    // trailing comma is not a hole and does not lengthen the table.
     int parseTable() {
         ++m_p;
         const int base = m_nk;
+        bool expectElem = true;
         for (;;) {
             skip();
             if (*m_p == ']') { ++m_p; break; }
-            const char* end = nullptr;
+            if (*m_p == ',') {                       // an elision: a real hole
+                ++m_p;
+                if (m_nk >= MAX_ELEM) return fail("table too large"), -1;
+                m_elem[m_nk++] = -1;
+                expectElem = true;
+                continue;
+            }
+            if (!expectElem) return fail("expected ',' or ']'"), -1;
+            const int e = parseExpr(1);              // above the comma
+            if (e < 0) return -1;
+            if (m_nk >= MAX_ELEM) return fail("table too large"), -1;
+            m_elem[m_nk++] = e;
+            expectElem = false;
             skip();
-            bool neg = false;
-            if (*m_p == '-') { neg = true; ++m_p; skip(); }
-            const double v = strtodc(m_p, &end);
-            if (end == m_p) return fail("a table may hold only numbers"), -1;
-            m_p = end;
-            if (m_nk >= MAX_CONST) return fail("table too large"), -1;
-            m_kpool[m_nk++] = neg ? -v : v;
-            skip();
-            if (*m_p == ',') { ++m_p; continue; }
+            if (*m_p == ',') { ++m_p; expectElem = true; continue; }
             if (*m_p == ']') { ++m_p; break; }
             return fail("expected ',' or ']'"), -1;
         }
@@ -445,8 +593,11 @@ private:
         const int base = m_nk;
         while (*m_p && *m_p != q) {
             if (*m_p == '\\') return fail("escapes in strings are not supported"), -1;
-            if (m_nk >= MAX_CONST) return fail("string too long"), -1;
-            m_kpool[m_nk++] = double(uint8_t(*m_p++));
+            if (m_nk >= MAX_ELEM) return fail("string too long"), -1;
+            const int kn = alloc(OP_K);
+            if (kn < 0) return -1;
+            m_pool[kn].k = double(uint8_t(*m_p++));
+            m_elem[m_nk++] = kn;
         }
         if (*m_p != q) return fail("unterminated string"), -1;
         ++m_p;
@@ -480,7 +631,11 @@ private:
             m_pool[nd].k = kv;
             return nd;
         }
-        if (is("random")) return fail("random is not supported"), -1;
+        if (is("random")) {
+            if (!eat("(")) return fail("expected '('"), -1;
+            if (!eat(")")) return fail("random takes no arguments"), -1;
+            return alloc(OP_RAND);
+        }
 
         uint8_t f1 = 0; bool has1 = true;
         if      (is("sin"))   f1 = F1_SIN;   else if (is("cos"))   f1 = F1_COS;
@@ -507,12 +662,14 @@ private:
         else hasN = false;
 
         if (!has1 && !has2 && !hasN) {
-            // Not a Math name, so a variable. Short names only: anything
-            // longer is a host object this evaluator has no business guessing
-            // at (`this`, `window`, `Array` and friends).
-            if (n > 3) return fail("unsupported name"), -1;
+            // Not a Math name, so a variable. A host object (`Array`,
+            // `parseInt`, `this`, `function`) is told apart not by the length
+            // of its name but by what follows it: a call or a property
+            // access. A plain name standing on its own is a variable, and
+            // songs name theirs `sine` and `tension` as readily as `a`.
+            if (n >= int(sizeof m_slotName[0])) return fail("name too long"), -1;
             skip();
-            if (*m_p == '(' || *m_p == '.') return fail("unsupported call"), -1;
+            if (*m_p == '.') return fail("unsupported property"), -1;
             char nm[12];
             const int ln = n < 11 ? n : 11;
             std::memcpy(nm, s, size_t(ln)); nm[ln] = 0;
@@ -523,6 +680,29 @@ private:
                 if (m_nslot >= MAX_SLOTS) return fail("too many variables"), -1;
                 sl = m_nslot++;
                 std::snprintf(m_slotName[sl], sizeof m_slotName[sl], "%s", nm);
+            }
+            skip();
+            if (*m_p == '(') {
+                if (m_fnOf[sl] < 0) return fail("unsupported call"), -1;
+                ++m_p;
+                int a2[MAX_ARGS]; int na2 = 0;
+                if (peek() != ')') {
+                    for (;;) {
+                        if (na2 >= MAX_ARGS) return fail("too many arguments"), -1;
+                        const int a3 = parseExpr(1);
+                        if (a3 < 0) return -1;
+                        a2[na2++] = a3;
+                        if (eat(",")) continue;
+                        break;
+                    }
+                }
+                if (!eat(")")) return fail("expected ')'"), -1;
+                const int nd2 = alloc(OP_CALL);
+                if (nd2 < 0) return -1;
+                m_pool[nd2].slot = m_fnOf[sl];
+                m_pool[nd2].n = uint8_t(na2);
+                for (int i = 0; i < na2; ++i) m_pool[nd2].arg[i] = a2[i];
+                return nd2;
             }
             const int nd = alloc(OP_VAR);
             if (nd < 0) return -1;
@@ -566,55 +746,80 @@ private:
     }
 
     // ── evaluation ──
-    double ev(int id, double* sl) const {
+    double ev(int id, Frame& f) const {
         if (id < 0 || id >= m_nn) return std::nan("");   // belt and braces
         const Node& n = m_pool[id];
         switch (n.op) {
             case OP_K:    return n.k;
-            case OP_VAR:  return sl[n.slot];
-            case OP_ASSIGN: return sl[n.slot] = ev(n.a, sl);
-            case OP_T:    return sl[0];
-            case OP_NEG:  return -ev(n.a, sl);
-            case OP_POS:  return  ev(n.a, sl);
-            case OP_BNOT: return double(~jsToInt32(ev(n.a, sl)));
-            case OP_LNOT: return jsTruthy(ev(n.a, sl)) ? 0.0 : 1.0;
+            case OP_VAR:  return f.v[n.slot];
+            case OP_ASSIGN: return f.v[n.slot] = ev(n.a, f);
+            case OP_RAND: return jsRandom(f.t0, f.rc);
+            case OP_CALL: {
+                const Func& fn = m_func[n.slot];
+                if (f.cd >= MAX_CALLD) return std::nan("");   // runaway recursion
+                // Arguments are evaluated BEFORE the parameter slots are
+                // touched, since an argument may read the slot it is about to
+                // fill (`v(t, p)` inside `v` itself).
+                double in[MAX_PARAM];
+                for (int i = 0; i < fn.nparam; ++i)
+                    in[i] = i < n.n ? ev(n.arg[i], f) : std::nan("");
+                double saved[MAX_PARAM];
+                for (int i = 0; i < fn.nparam; ++i) saved[i] = f.v[fn.slot[i]];
+                for (int i = 0; i < fn.nparam; ++i) {
+                    // A default is evaluated with the earlier parameters
+                    // already bound, which is the order JavaScript uses.
+                    f.v[fn.slot[i]] = (i < n.n) ? in[i]
+                                     : (fn.dflt[i] >= 0 ? ev(fn.dflt[i], f) : std::nan(""));
+                }
+                ++f.cd;
+                const double r = ev(fn.body, f);
+                --f.cd;
+                for (int i = 0; i < fn.nparam; ++i) f.v[fn.slot[i]] = saved[i];
+                return r;
+            }
+            case OP_T:    return f.v[0];
+            case OP_NEG:  return -ev(n.a, f);
+            case OP_POS:  return  ev(n.a, f);
+            case OP_BNOT: return double(~jsToInt32(ev(n.a, f)));
+            case OP_LNOT: return jsTruthy(ev(n.a, f)) ? 0.0 : 1.0;
 
-            case OP_ADD:  return ev(n.a, sl) + ev(n.b, sl);
-            case OP_SUB:  return ev(n.a, sl) - ev(n.b, sl);
-            case OP_MUL:  return ev(n.a, sl) * ev(n.b, sl);
-            case OP_DIV:  return ev(n.a, sl) / ev(n.b, sl);
-            case OP_MOD:  return std::fmod(ev(n.a, sl), ev(n.b, sl));
-            case OP_EXP:  return std::pow(ev(n.a, sl), ev(n.b, sl));
+            case OP_ADD:  return ev(n.a, f) + ev(n.b, f);
+            case OP_SUB:  return ev(n.a, f) - ev(n.b, f);
+            case OP_MUL:  return ev(n.a, f) * ev(n.b, f);
+            case OP_DIV:  return ev(n.a, f) / ev(n.b, f);
+            case OP_MOD:  return std::fmod(ev(n.a, f), ev(n.b, f));
+            case OP_EXP:  return std::pow(ev(n.a, f), ev(n.b, f));
 
-            case OP_SHL:  return double(int32_t(jsToUint32(ev(n.a, sl)) << (jsToUint32(ev(n.b, sl)) & 31u)));
-            case OP_SHR:  return double(jsToInt32(ev(n.a, sl)) >> (jsToUint32(ev(n.b, sl)) & 31u));
-            case OP_USHR: return double(jsToUint32(ev(n.a, sl)) >> (jsToUint32(ev(n.b, sl)) & 31u));
+            case OP_SHL:  return double(int32_t(jsToUint32(ev(n.a, f)) << (jsToUint32(ev(n.b, f)) & 31u)));
+            case OP_SHR:  return double(jsToInt32(ev(n.a, f)) >> (jsToUint32(ev(n.b, f)) & 31u));
+            case OP_USHR: return double(jsToUint32(ev(n.a, f)) >> (jsToUint32(ev(n.b, f)) & 31u));
 
-            case OP_AND:  return double(jsToInt32(ev(n.a, sl)) & jsToInt32(ev(n.b, sl)));
-            case OP_OR:   return double(jsToInt32(ev(n.a, sl)) | jsToInt32(ev(n.b, sl)));
-            case OP_XOR:  return double(jsToInt32(ev(n.a, sl)) ^ jsToInt32(ev(n.b, sl)));
+            case OP_AND:  return double(jsToInt32(ev(n.a, f)) & jsToInt32(ev(n.b, f)));
+            case OP_OR:   return double(jsToInt32(ev(n.a, f)) | jsToInt32(ev(n.b, f)));
+            case OP_XOR:  return double(jsToInt32(ev(n.a, f)) ^ jsToInt32(ev(n.b, f)));
 
-            case OP_LT:   return ev(n.a, sl) <  ev(n.b, sl) ? 1.0 : 0.0;
-            case OP_GT:   return ev(n.a, sl) >  ev(n.b, sl) ? 1.0 : 0.0;
-            case OP_LE:   return ev(n.a, sl) <= ev(n.b, sl) ? 1.0 : 0.0;
-            case OP_GE:   return ev(n.a, sl) >= ev(n.b, sl) ? 1.0 : 0.0;
-            case OP_EQ:   return ev(n.a, sl) == ev(n.b, sl) ? 1.0 : 0.0;
-            case OP_NE:   return ev(n.a, sl) != ev(n.b, sl) ? 1.0 : 0.0;
+            case OP_LT:   return ev(n.a, f) <  ev(n.b, f) ? 1.0 : 0.0;
+            case OP_GT:   return ev(n.a, f) >  ev(n.b, f) ? 1.0 : 0.0;
+            case OP_LE:   return ev(n.a, f) <= ev(n.b, f) ? 1.0 : 0.0;
+            case OP_GE:   return ev(n.a, f) >= ev(n.b, f) ? 1.0 : 0.0;
+            case OP_EQ:   return ev(n.a, f) == ev(n.b, f) ? 1.0 : 0.0;
+            case OP_NE:   return ev(n.a, f) != ev(n.b, f) ? 1.0 : 0.0;
 
             // These return an operand, as JS does, and short-circuit.
-            case OP_LAND: { const double a = ev(n.a, sl); return jsTruthy(a) ? ev(n.b, sl) : a; }
-            case OP_LOR:  { const double a = ev(n.a, sl); return jsTruthy(a) ? a : ev(n.b, sl); }
-            case OP_COMMA: ev(n.a, sl); return ev(n.b, sl);
-            case OP_COND: return jsTruthy(ev(n.a, sl)) ? ev(n.b, sl) : ev(n.c, sl);
+            case OP_LAND: { const double a = ev(n.a, f); return jsTruthy(a) ? ev(n.b, f) : a; }
+            case OP_LOR:  { const double a = ev(n.a, f); return jsTruthy(a) ? a : ev(n.b, f); }
+            case OP_COMMA: ev(n.a, f); return ev(n.b, f);
+            case OP_COND: return jsTruthy(ev(n.a, f)) ? ev(n.b, f) : ev(n.c, f);
 
             case OP_TABLE: {
-                const double fi = ev(n.a, sl);
+                const double fi = ev(n.a, f);
                 if (!(fi >= 0) || fi != std::floor(fi) || fi >= double(n.tn))
                     return std::nan("");          // `undefined` in arithmetic
-                return m_kpool[n.ti + int(fi)];
+                const int32_t e = m_elem[n.ti + int(fi)];
+                return e < 0 ? std::nan("") : ev(e, f);   // a hole is undefined
             }
             case OP_F1: {
-                const double a = ev(n.a, sl);
+                const double a = ev(n.a, f);
                 switch (n.fi) {
                     case F1_SIN:   return std::sin(a);   case F1_COS:  return std::cos(a);
                     case F1_TAN:   return std::tan(a);   case F1_ASIN: return std::asin(a);
@@ -630,20 +835,20 @@ private:
                 }
             }
             case OP_F2: {
-                const double a = ev(n.a, sl), b = ev(n.b, sl);
+                const double a = ev(n.a, f), b = ev(n.b, f);
                 return n.fi == F2_POW ? std::pow(a, b) : std::atan2(a, b);
             }
             default: {
                 if (n.fi == FN_HYPOT) {
                     double s = 0;
-                    for (int i = 0; i < n.n; ++i) { const double v = ev(n.arg[i], sl); s += v * v; }
+                    for (int i = 0; i < n.n; ++i) { const double v = ev(n.arg[i], f); s += v * v; }
                     return std::sqrt(s);
                 }
                 // Math.min() is Infinity and Math.max() is -Infinity, and a
                 // NaN argument poisons both.
                 double r = (n.fi == FN_MIN) ? HUGE_VAL : -HUGE_VAL;
                 for (int i = 0; i < n.n; ++i) {
-                    const double v = ev(n.arg[i], sl);
+                    const double v = ev(n.arg[i], f);
                     if (std::isnan(v)) return v;
                     if (n.fi == FN_MIN ? (v < r) : (v > r)) r = v;
                 }
@@ -658,15 +863,25 @@ private:
 // four playback modes differ only in how a number becomes that byte.
 enum : uint8_t { MODE_BYTE = 0, MODE_SIGNED = 1, MODE_FLOAT = 2 };
 
-inline float exprByte(const Expr& e, int mode, double t) {
+// In double, which is what the language is defined in. The verifier compares
+// this against node, so a disagreement means a difference in SEMANTICS and not
+// merely in storage -- float32 would blur the two, and a song that is really
+// being played right would look like one that is not.
+inline double exprValue(const Expr& e, int mode, double t) {
     const double v = e.eval(t);
     if (mode == MODE_FLOAT) {
-        if (std::isnan(v)) return 127.5f;
+        if (std::isnan(v)) return 127.5;
         const double c = v < -1 ? -1 : (v > 1 ? 1 : v);
-        return float((c + 1.0) * 127.5);          // kept fractional, not rounded
+        return (c + 1.0) * 127.5;                 // kept fractional, not rounded
     }
     const int32_t i = jsToInt32(v);
-    return float(uint32_t(mode == MODE_SIGNED ? i + 128 : i) & 255u);
+    return double(uint32_t(mode == MODE_SIGNED ? i + 128 : i) & 255u);
+}
+
+// What the engine plays. Single precision is ordinary for audio and still far
+// finer than the eight bits a bytebeat byte carries.
+inline float exprByte(const Expr& e, int mode, double t) {
+    return float(exprValue(e, mode, t));
 }
 
 } // namespace gritty

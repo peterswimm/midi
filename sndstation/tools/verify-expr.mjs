@@ -13,7 +13,20 @@ const BASES = [0, 8000, 100000, 1000000];
 // reference run that leaves it out is testing the wrong language.
 const MATH_HEADER = `var { ${
     Object.getOwnPropertyNames(Math).filter(k => k !== 'constructor').join(', ')
-} } = Math; var int = Math.trunc; var window = globalThis;`;
+} } = Math; var int = Math.trunc; var window = globalThis;
+var random = globalThis.__rnd; Math.random = globalThis.__rnd;`;
+
+// The same reproducible noise expr.h uses, bit for bit: a hash of the sample
+// index and the call number. Math.imul is the exact uint32 multiply.
+globalThis.__rc = 0;
+globalThis.__t0 = 0;
+globalThis.__rnd = function () {
+    let h = (globalThis.__t0 ^ Math.imul(globalThis.__rc++, 0x9E3779B1)) >>> 0;
+    h = Math.imul(h ^ (h >>> 16), 0x85EBCA6B) >>> 0;
+    h = Math.imul(h ^ (h >>> 13), 0xC2B2AE35) >>> 0;
+    h = (h ^ (h >>> 16)) >>> 0;
+    return h / 4294967296;
+};
 
 // The composer's own byte conversions, mode for mode.
 function toByte(v, mode) {
@@ -48,6 +61,8 @@ for await (const line of rl) {
     try {
         for (const base of BASES)
             for (let i = 0; i < 64; ++i) {
+                globalThis.__t0 = (base + i) | 0;
+                globalThis.__rc = 0;
                 const v = fn(base + i);
                 if (typeof v !== 'number') throw new TypeError('not a number');
                 const b = toByte(v, mode);

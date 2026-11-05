@@ -241,28 +241,45 @@ processor: every `Math` name in scope as a bare name, `int` as `Math.trunc`,
 `window` as the global. A song written `sin(t)` depends on that, so a reference
 run without it would be testing the wrong language.
 
-From the archive as it stood on 2026-11-05, that is **536 songs by 232
+From the archive as it stood on 2026-11-05, that is **810 songs by 232
 authors**, out of 1112 that carry their code inline. Honestly, where the rest
 go:
 
 | | |
 |---|---|
 | 894 | no inline code in the index — they live as separate files on the server |
-| 517 | past this evaluator's grammar |
+| 260 | past this evaluator's grammar |
 | 76 | stereo (a two-element return); the map is mono |
-| 47 | render differently from node, so dropped on principle |
+| 30 | render differently from node, so dropped on principle |
 | 12 | node itself will not run them |
 | 6 | truncated in the index |
 | 3 | Funcbeat — statements, a different language |
 
 The grammar is expressions, not statements: the operators with JavaScript's
-coercions, `Math`, constant lookup tables, strings via `[i]` and
-`.charCodeAt(i)`, the ternary, and plain local variables in a frame that starts
-fresh each sample. `Math.random` is refused deliberately — it would make a song
-sound different on every pass, which breaks both the determinism the blend
-rests on and any hope of verifying anything. A song whose variables carry state
-between samples renders differently from node and is dropped by that rule
-rather than by a special case.
+coercions, `Math` under both its bare and qualified names, binary and octal
+literals, lookup tables whose elements are themselves expressions (holes
+included), strings via `[i]` and `.charCodeAt(i)`, the ternary, named local
+variables in a frame that starts fresh each sample, and arrow functions with
+default parameters — which is how a song carries one voice and plays it at
+several pitches. What remains out is host objects (`Array`, `parseInt`,
+`.length`), arrays held in variables rather than written in place, and function
+bodies made of statements.
+
+`random()` is the one place this port deliberately departs from the composer.
+True randomness would make a song sound different on every pass, which breaks
+the determinism the blend rests on — the same map position must sound the same
+every time — and makes verification impossible. So `random()` is a hash of the
+sample index and the call number: white noise with the same distribution, drawn
+fresh at every tick, identical on every pass and in both evaluators. The song
+gets the noise it asked for and we can still prove we are playing it right.
+
+A song whose variables carry state between samples renders differently from
+node and is dropped by that rule rather than by a special case.
+
+Verification is done in double, which is what the language is defined in, while
+the engine plays in float as audio normally does. Conflating the two would make
+ordinary single-precision rounding look like a song played wrong — it accounted
+for 85 of the apparent mismatches before the two were separated.
 
 Two things a loaded song carries that a built-in does not. Its **playback
 mode** — unsigned byte, signed byte, or float, the last kept fractional rather
@@ -278,8 +295,8 @@ change rewrite the patterns under you would make the map unnavigable, and a
 free lane bypasses the sequencer anyway, which is where a loaded song has the
 most to say.
 
-Interpreting costs about three and a half times what the built-ins do — 2% of
-one core for three lanes against 0.6% — which is still nothing on a handheld.
+Interpreting costs a few times what the built-ins do — 1.6% of one core for
+three lanes against 0.3% — which is still nothing on a handheld.
 
 ## Building
 
