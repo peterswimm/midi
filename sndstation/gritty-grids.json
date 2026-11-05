@@ -1,0 +1,6 @@
+{
+  "name":        "Gritty Grids",
+  "description": "A bytebeat drum machine on a 5x5 map of one-liners",
+  "exec":        ["gritty-grids"],
+  "order":       40
+}
