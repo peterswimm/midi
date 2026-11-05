@@ -102,7 +102,9 @@ struct Ctl {
     int               lo, hi, step;
 };
 
-Ctl  g_ctl[2 + 3 * 7];
+std::atomic<int> g_libPage{0};        // which page of an imported library
+
+Ctl  g_ctl[4 + 3 * 7];
 int  g_nCtl = 0;
 int  g_cursor = 0;
 
@@ -110,6 +112,9 @@ void buildControls() {
     g_nCtl = 0;
     g_ctl[g_nCtl++] = {"BPM",   -1, &g_params.bpm,   40, 240, 1};
     g_ctl[g_nCtl++] = {"CHAOS", -1, &g_params.chaos,  0, 200, 2};
+    g_ctl[g_nCtl++] = {"MIX",   -1, &g_params.blend,  0,   2, 1};
+    g_ctl[g_nCtl++] = {"LIB",   -1, &g_libPage, 0,
+                       bank().pages() > 0 ? bank().pages() - 1 : 0, 1};
     for (int i = 0; i < 3; ++i) {
         g_ctl[g_nCtl++] = {"F", i, &g_params.freeRun[i], 0,   1, 1};
         g_ctl[g_nCtl++] = {"K", i, &g_params.key[i],   -24,  24, 1};
@@ -123,6 +128,7 @@ void buildControls() {
 // A control the current mode has no use for is skipped by the cursor, the way
 // the demo hides L outside Formula and P outside Bit voice.
 bool ctlLive(const Ctl& c) {
+    if (c.lane < 0 && c.label[0] == 'L') return bank().songs() > 0;
     // A free lane has no sequencer and no envelope, so the five controls that
     // drive them are not dimmed, they are gone: only F and its key remain.
     if (c.lane >= 0 && g_params.isFree(c.lane))
@@ -154,9 +160,17 @@ std::string ctlValue(const Ctl& c) {
     const int v = c.v->load();
     const int i = c.lane;
     if (c.lane < 0) {
-        if (c.label[0] == 'B') { std::snprintf(buf, sizeof buf, "%d", v); return buf; }
-        std::snprintf(buf, sizeof buf, "%d%%", int(std::lround(v / 200.0 * 100)));
-        return buf;
+        switch (c.label[0]) {
+            case 'B': std::snprintf(buf, sizeof buf, "%d", v); return buf;
+            case 'M': return blendName(v);
+            case 'L':
+                if (bank().songs() <= 0) return "--";
+                std::snprintf(buf, sizeof buf, "%d/%d", v + 1, bank().pages());
+                return buf;
+            default:
+                std::snprintf(buf, sizeof buf, "%d%%", int(std::lround(v / 200.0 * 100)));
+                return buf;
+        }
     }
     switch (c.label[0]) {
         case 'F': return v ? "FREE" : "SEQ";
@@ -389,12 +403,15 @@ void drawBlend(SDL_Renderer* r, int bx, int by, int w) {
     const int X = g_params.x.load(), Y = g_params.y.load();
     const Corners c = cornersAt(X, Y);
     const int dom = domNode(X, Y);
-    const Node* N = nodes();
+    const Slot& D = bank().slot(dom);
 
-    char hdr[64];
-    std::snprintf(hdr, sizeof hdr, "node %d \xC2\xB7 %s", dom, N[dom].author);
+    // Whoever wrote the program under the puck gets their name on the screen,
+    // built-in or imported. A library page is two thousand people's work; the
+    // port does not show you any of it unattributed.
+    char hdr[80];
+    std::snprintf(hdr, sizeof hdr, "node %d \xC2\xB7 %s", dom, D.author);
     gfx::textMid(r, Font::Small, hdr, bx, by + su(6), P.txt2);
-    gfx::textMid(r, Font::Label, N[dom].expr, bx, by + su(24), P.phos);
+    gfx::textMid(r, Font::Label, D.name, bx, by + su(24), P.phos);
 
     char coord[32];
     std::snprintf(coord, sizeof coord, "X %d \xC2\xB7 Y %d", X, Y);
@@ -415,7 +432,7 @@ void drawBlend(SDL_Renderer* r, int bx, int by, int w) {
         char tag[16];
         std::snprintf(tag, sizeof tag, "n%d", ni);
         gfx::textMid(r, Font::Small, tag, bx, y + su(7), isDom ? P.amber : P.txt2);
-        gfx::textMid(r, Font::Small, N[ni].expr, bx + su(26), y + su(7),
+        gfx::textMid(r, Font::Small, bank().slot(ni).name, bx + su(26), y + su(7),
                      isDom ? P.txt0 : P.txt1);
         char p[8];
         std::snprintf(p, sizeof p, "%d%%", pct);
@@ -691,6 +708,7 @@ int bench(double seconds) {
 } // namespace
 
 int main(int argc, char** argv) {
+    const char* libPath = nullptr;
     WindowOptions wo;
     wo.title = "gritty-grids";
     std::string shots;
@@ -698,9 +716,28 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if      (!std::strcmp(argv[i], "--shots") && i + 1 < argc) shots = argv[++i];
         else if (!std::strcmp(argv[i], "--bench") && i + 1 < argc) benchSec = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--library") && i + 1 < argc) libPath = argv[++i];
         else if (!std::strcmp(argv[i], "--dark")) P = PAL_DARK;
         else if (!std::strcmp(argv[i], "--res")   && i + 1 < argc)
             std::sscanf(argv[++i], "%dx%d", &wo.width, &wo.height);
+    }
+    // A library is loaded before the controls are built, because whether the
+    // LIB control exists at all depends on whether there is one.
+    if (libPath) {
+        const int n = bank().load(libPath);
+        if (n < 0) {
+            std::fprintf(stderr, "gritty: cannot read library '%s'\n", libPath);
+            return 1;
+        }
+        if (n == 0) {
+            std::fprintf(stderr, "gritty: '%s' holds no songs\n", libPath);
+            return 1;
+        }
+        bank().setPage(0);
+        std::fprintf(stderr, "gritty: %d songs, %d pages of 25", n, bank().pages());
+        if (bank().tooLong()) std::fprintf(stderr, ", %d too long to hold", bank().tooLong());
+        if (bank().failed())  std::fprintf(stderr, ", %d would not compile on this page", bank().failed());
+        std::fputc('\n', stderr);
     }
     buildControls();
     if (benchSec > 0) return bench(benchSec);
@@ -880,6 +917,13 @@ int main(int argc, char** argv) {
         // the puck: stick is a velocity, a D-pad direction is a step until
         // something is bound to it, and then it is a glide to that spot
         const float speed = 150.0f;    // units per second at full deflection
+        // Paging the library recompiles 25 programs, which is why it happens
+        // here on the UI thread and not wherever the control was turned.
+        if (bank().songs() > 0 && g_libPage.load() != bank().page()) {
+            bank().setPage(g_libPage.load());
+            g_engine.rewind();
+        }
+
         g_bindHint = st.down(pad::L3) ? 1 : (st.down(pad::R3) ? 2 : 0);
         if (std::fabs(st.lx) > 0.12f || std::fabs(st.ly) > 0.12f) g_travel = -1;
         puckX += st.lx * speed * dt;

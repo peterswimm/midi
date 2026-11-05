@@ -67,10 +67,47 @@ The puck is the instrument; everything else is a modifier.
 | **Y** | jump to the next lane's controls |
 | **F** (per lane) | sequencer off: the formula plays itself |
 | **K** (per lane) | transpose a free lane, in semitones |
+| **MIX** | how the four corners blend: `DITH`, `NEAR`, `MEAN` |
+| **LIB** | which page of an imported library the map is made of |
 | **L1 / R1** | pick a control |
 | **L2 / R2** | change it — hold to repeat, and it coarsens the longer you hold |
 | **SELECT** | back to the defaults, and clear the destinations |
 | **START** | quit (back to the launcher on a handheld) |
+
+### The blend
+
+The map is 25 programs and the puck is almost never standing on one, so
+something has to decide what you hear in between. The first answer here was a
+weighted average of the four nearest nodes' bytes. That is wrong in a way that
+matters.
+
+A bytebeat byte is a **bit pattern**, not a sample on a continuum. The music is
+in the `&`, the `|`, the `^` and the carries of a multiply. Average four
+unrelated programs and you land between every pattern and on none of them; the
+arithmetic character — the thing that makes a one-liner sound like anything at
+all — is the first thing to go. Four distinct drum programs average to a wash.
+
+So `MIX DITH`, the default, does not invent a byte. It **chooses** one, per
+tick, from a real program, each corner winning ticks in proportion to its
+bilinear weight. Over a beat you hear the mixture; over any single tick you
+hear one authentic byte. This is how Grids itself blends — by probability, not
+by averaging — and it is what a bytebeat remix does by hand.
+
+The choice is made with the van der Corput sequence, the bit-reversal of the
+tick index, rather than a random number. Equidistribution is the entire point:
+white noise clumps, and a clump is an audible stutter of one program where the
+weights promised a mixture. Being a pure function of `t`, it is also
+deterministic — the same map position sounds the same every time, which is why
+it can be tested at all.
+
+Two details worth knowing. A corner under 2% is dropped rather than handed rare
+ticks, because one byte in fifty from a program you are nowhere near reads as a
+click, not as a blend. And above 92% a node plays alone, so every node sits in a
+plateau where the formula is exactly itself.
+
+`NEAR` plays the dominant corner only, with a hard switch at the cell
+boundaries. `MEAN` is the old average, kept because the difference is the point
+and ought to stay audible.
 
 ### Destinations
 
@@ -157,6 +194,93 @@ With no pad attached the footer names those keys rather than the pad's buttons �
 to say "L1/R1 pick" to someone holding a keyboard, which is the one moment the hint
 mattered.
 
+## Playing a library
+
+The map ships as 25 one-liners from viznut's 2011 collection, hand-ported into
+C++ in `bytebeat.h` and bit-exact. That is the right way to carry 25 formulas
+and the wrong way to carry two thousand, so there is a second evaluator:
+`expr.h` reads the JavaScript these programs are actually written in and plays
+it directly. Point the app at a library pack and the map is made of that
+instead — same blend, same destinations, same free lanes, somebody else's
+music.
+
+```bash
+./build/gritty-grids --library library.pack
+```
+
+`LIB` on the control strip pages through it, 25 songs at a time. Whoever wrote
+the program under the puck has their name on the screen, built-in or imported.
+
+### Making a pack
+
+```bash
+tools/import-library.py ~/Downloads/all.gz -o library.pack
+```
+
+The input is the song index published by
+[bytebeat-composer](https://github.com/SthephanShinkufag/bytebeat-composer),
+served at `data/library/all.gz`.
+
+**Download your own copy; nothing from it is committed here, and `library.pack`
+is gitignored.** The composer's own source is MIT, but the library is not the
+composer: it is about two thousand separate compositions by a couple of hundred
+named people, each published by its author with their name attached, and it
+does not live in that repository at all. They are theirs to distribute, not
+ours to vendor. So the port carries the machinery and you bring the music —
+which also means a re-download gets you everything added since.
+
+### What a pack keeps, and what it drops
+
+Every song is rendered twice — once by `expr.h` and once by **node**, the
+engine these programs were written for — and kept only where the two agree
+exactly. A song this port would play even slightly differently is dropped. A
+near-miss is not a near-miss; it is somebody's music played wrong.
+
+The reference run uses the composer's own preamble, copied from its audio
+processor: every `Math` name in scope as a bare name, `int` as `Math.trunc`,
+`window` as the global. A song written `sin(t)` depends on that, so a reference
+run without it would be testing the wrong language.
+
+From the archive as it stood on 2026-11-05, that is **536 songs by 232
+authors**, out of 1112 that carry their code inline. Honestly, where the rest
+go:
+
+| | |
+|---|---|
+| 894 | no inline code in the index — they live as separate files on the server |
+| 517 | past this evaluator's grammar |
+| 76 | stereo (a two-element return); the map is mono |
+| 47 | render differently from node, so dropped on principle |
+| 12 | node itself will not run them |
+| 6 | truncated in the index |
+| 3 | Funcbeat — statements, a different language |
+
+The grammar is expressions, not statements: the operators with JavaScript's
+coercions, `Math`, constant lookup tables, strings via `[i]` and
+`.charCodeAt(i)`, the ternary, and plain local variables in a frame that starts
+fresh each sample. `Math.random` is refused deliberately — it would make a song
+sound different on every pass, which breaks both the determinism the blend
+rests on and any hope of verifying anything. A song whose variables carry state
+between samples renders differently from node and is dropped by that rule
+rather than by a special case.
+
+Two things a loaded song carries that a built-in does not. Its **playback
+mode** — unsigned byte, signed byte, or float, the last kept fractional rather
+than rounded back down to eight bits. And its own **sample rate**: a song
+written for 44100 is not a slower version of itself at 8000, it is two and a
+half octaves down with its rhythm stretched, so each slot scales its own `t`
+and four songs with four native rates can sit on one map and each still be
+itself.
+
+The rhythm map stays Grids. The 25 interpolated drum patterns are the
+instrument's groove structure; the loaded songs are its voices. Letting a page
+change rewrite the patterns under you would make the map unnavigable, and a
+free lane bypasses the sequencer anyway, which is where a loaded song has the
+most to say.
+
+Interpreting costs about three and a half times what the built-ins do — 2% of
+one core for three lanes against 0.6% — which is still nothing on a handheld.
+
 ## Building
 
 You need SDL2 and a checkout of sndstation.
@@ -186,6 +310,7 @@ what to do about it, rather than at link time.
 
 | | |
 |---|---|
+| `--library FILE` | load a library pack and make the map out of it, 25 songs at a time |
 | `--dark` | the demo's phosphor palette instead of the default paper one |
 | `--res WxH` | force the layout size |
 | `--shots DIR` | headless: write one BMP per screen state (both engines x both rhythm sources) and exit. No display needed. |
@@ -287,8 +412,15 @@ ladder, the kick's pitch drop and the 1-bit grit are all the demo's own numbers.
 | | |
 |---|---|
 | [`bytebeat.h`](bytebeat.h) | the 25 nodes, with JavaScript's integer semantics spelled out |
+| [`expr.h`](expr.h) | a bytebeat expression, parsed and played — the JavaScript subset |
+| [`bank.h`](bank.h) | which 25 programs the map is currently made of |
 | [`engine.h`](engine.h) | the map, the blend, both engines, as one render callback |
 | [`main.cpp`](main.cpp) | the screen, the pad, the controls, `--shots` and `--bench` |
 | [`test_bytebeat.cpp`](test_bytebeat.cpp) | the golden values and the dense-sweep hash |
 | [`test_free.cpp`](test_free.cpp) | proof that nothing processes a free lane |
+| [`test_blend.cpp`](test_blend.cpp) | proof that the blend never invents a byte |
+| [`test_expr.cpp`](test_expr.cpp) | the evaluator against the 25 hand-ported formulas |
+| [`tools/import-library.py`](tools/import-library.py) | verify a library against node, write a pack |
+| [`tools/verify-expr.cpp`](tools/verify-expr.cpp) | render expressions with `expr.h`, for comparison |
+| [`tools/verify-expr.mjs`](tools/verify-expr.mjs) | render the same, from a real JavaScript engine |
 | [`gritty-grids.json`](gritty-grids.json) | the launcher's manifest |

@@ -39,7 +39,12 @@ target_compile_options(test_free PRIVATE -Wall -Wextra)
 add_executable(test_blend test_blend.cpp)
 target_compile_options(test_blend PRIVATE -Wall -Wextra)
 
+# The evaluator against the hand-ported formulas.
+add_executable(test_expr test_expr.cpp)
+target_compile_options(test_expr PRIVATE -Wall -Wextra)
+
 enable_testing()
 add_test(NAME bytebeat COMMAND test_bytebeat)
 add_test(NAME free COMMAND test_free)
 add_test(NAME blend COMMAND test_blend)
+add_test(NAME expr COMMAND test_expr)

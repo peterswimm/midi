@@ -11,7 +11,7 @@
 // RNG: a grain's wavetable lives in a fixed pool slot, and the one random
 // source is an xorshift32 owned by the engine.
 #pragma once
-#include "bytebeat.h"
+#include "bank.h"
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -189,15 +189,15 @@ inline int blendPick(const Corners& c, int64_t ti) {
 inline float blendByte(const Corners& c, int64_t ti, int bmode) {
     if (bmode == int(Blend::Mean)) {
         float v = 0;
-        for (int k = 0; k < 4; ++k) v += c.w[k] * float(sample(c.idx[k], ti));
+        for (int k = 0; k < 4; ++k) v += c.w[k] * nodeValue(c.idx[k], ti);
         return v;
     }
     if (bmode == int(Blend::Nearest)) {
         int best = 0;
         for (int k = 1; k < 4; ++k) if (c.w[k] > c.w[best]) best = k;
-        return float(sample(c.idx[best], ti));
+        return nodeValue(c.idx[best], ti);
     }
-    return float(sample(c.idx[blendPick(c, ti)], ti));
+    return nodeValue(c.idx[blendPick(c, ti)], ti);
 }
 
 inline float levelAt(const Corners& c, int lane, int step) {
