@@ -20,7 +20,8 @@ ratchets, and Chaos.
 
 *Bitseq, Formula rhythm: the puck sits between four programs, the readout names them and
 their weights, and the three tracks are running at 16 / 12 / 9. The three rings on the map
-are destinations bound to D-pad directions — the amber one is being travelled to.
+are patches bound to D-pad directions — the amber one is being morphed to, half way
+there, with BPM, Chaos and the lane controls all part way between the two.
 ([Bit voice](docs/voice-formula.png) adds a 1-bit trace per lane;
 [`--dark`](docs/bitseq-formula-dark.png) is the demo's phosphor.)*
 
@@ -54,8 +55,8 @@ The puck is the instrument; everything else is a modifier.
 | | |
 |---|---|
 | **Left stick** | move the puck — this is the whole gesture |
-| **D-pad** | move the puck, slower — until a destination is bound to that direction |
-| **L3 + a direction** | bind the puck's spot to that D-pad direction |
+| **D-pad** | move the puck, slower — until a patch is bound to that direction |
+| **L3 + a direction** | bind the whole patch to that D-pad direction |
 | **R3 + a direction** | unbind it |
 | **A** | Run / Stop (a run always starts at pulse 0) |
 | **B** | engine: Bitseq / Bit voice |
@@ -68,24 +69,41 @@ The puck is the instrument; everything else is a modifier.
 
 ### Destinations
 
-The D-pad nudges the puck, which is what you want while the map is unfamiliar. Once you
-know where the good patterns are, the four directions can hold them: hold **L3** and press
-a direction to bind the puck's current position to it, and that direction travels there
-from then on. **R3** and a direction unbinds it. Bound spots show on the map as rings
-with a pip on the side they answer to, amber while one is being travelled to.
+A destination is a **whole patch, not a place**: the puck's position *and* every
+parameter — BPM, Chaos, both engine switches, and all five controls on each of the three
+lanes. Hold **L3** and press a direction to bind the current state to it; **R3** and a
+direction unbinds. Press a bound direction and the instrument travels there. **SELECT**
+clears all four along with the rest of the reset; nothing is written to disk.
 
-Travel is a glide, not a jump — sweeping through the intermediate blends is most of what
-the map is for, and cutting straight there throws away the part worth hearing. The stick
-interrupts a glide at any point, so a destination is a gesture you start rather than a
-mode you are stuck in. Destinations live in the session; nothing is written to disk.
+Travel is a glide, not a jump, and it glides *everything*. A recall is a morph between
+two patches, and the sweep through the middle is itself worth hearing — cutting straight
+to the destination throws that away. A long hop takes longer than a short one, between
+0.18 and 0.9 seconds, eased at both ends. The engine and rhythm-source switches cannot be
+interpolated, so they snap at the start and the destination's engine carries the morph.
 
-Controls the current mode has no use for are skipped: **L** (track length) only exists
-in Formula, **P** only in Bit voice, exactly as the web demo hides them. **D** is density
-in Bitseq and pitch in Bit voice, and reads out in the right units for each.
+The stick interrupts a glide at any point, which leaves every value halfway between the
+two patches. That is the point rather than a wrinkle: half of a morph is a patch you did
+not have, and you can bind *that* to another direction.
+
+Bound patches show on the map as rings at their stored position, with a pip on the side
+they answer to, amber for the one being travelled to; the HUD shows how far along the
+morph is. The pip is drawn geometry rather than an `↑`, because Open Sans has no arrow
+glyphs at this size — worth knowing before anyone simplifies it back to a character.
+
+### Reaching the rest of the controls
+
+Only BPM, Chaos and the focused lane's five are on the strip at once. **L1 / R1** walk the
+whole list, crossing into the next lane when they run out; **Y** jumps straight to the
+next lane. A control the current mode has no use for is skipped rather than shown dead:
+**L** (track length) only exists in Formula, **P** only in Bit voice. **D** is density in
+Bitseq and pitch in Bit voice, and reads out in the right units for each.
 
 On a desktop the keyboard is a full pad (sndstation's own fallback): arrows for the
 D-pad, **Z** and **X** for A and B, **C** and **V** for X and Y, **1**/**4** for L1/R1,
 **2**/**3** for L2/R2, **E** and **I** for L3/R3, **Backspace** reset, **Return** quit.
+With no pad attached the footer names those keys rather than the pad's buttons — it used
+to say "L1/R1 pick" to someone holding a keyboard, which is the one moment the hint
+mattered.
 
 ## Building
 

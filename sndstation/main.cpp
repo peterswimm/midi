@@ -169,21 +169,89 @@ std::string ctlValue(const Ctl& c) {
 }
 
 // ── destinations on the D-pad ──
-// The D-pad starts out as a slow nudge, which is what you want while the map
-// is unfamiliar. Once you know where the good patterns are, the four
-// directions become waypoints: hold L3 and press a direction to bind the
-// puck's current position to it, and from then on that direction travels
-// there instead of nudging. L3 was free, and so was R3, which unbinds.
+// A destination is a whole patch, not a place: the puck's position and every
+// parameter — BPM, Chaos, both engine switches, and all five controls on each
+// of the three lanes. Binding the position alone turned out to be the lesser
+// half of the idea, since the map only sets the pattern and the lane controls
+// are what make it a sound.
 //
-// Travel is a glide, not a jump. Sweeping through the intermediate blends is
-// most of what the map is for, and cutting straight to the destination throws
-// away the part worth hearing. The stick interrupts a glide at any point, so
-// the waypoint is a starting gesture rather than a mode you are stuck in.
-struct Dest { bool set = false; int x = 0, y = 0; };
-Dest g_dest[4];                        // Up, Down, Left, Right
-int  g_travel = -1;                    // slot being travelled to, -1 = none
-int  g_bindHint = 0;                   // 0 none, 1 binding, 2 clearing
-constexpr float TRAVEL_RATE = 620.0f;  // map units a second (255 in ~0.4s)
+// Hold L3 and press a direction to bind the current state to it; R3 and a
+// direction unbinds. A bound direction then travels there, and travel is a
+// glide rather than a jump — the continuous values ramp together, so a recall
+// is a morph between two patches and the sweep is itself worth hearing. The
+// two switches (engine, rhythm source) cannot be interpolated, so they snap at
+// the start and you hear the destination's engine while the rest arrives.
+//
+// The stick interrupts a glide at any point, which leaves every value halfway
+// between the two patches. That is a feature: half of a morph is a patch you
+// did not have.
+struct Snap {
+    bool set = false;
+    int  x = 128, y = 128, bpm = 120, chaos = 30, mode = 0, rhythm = 0;
+    int  dens[3]{}, len[3]{}, atk[3]{}, rel[3]{}, prob[3]{};
+};
+Snap  g_dest[4];                       // Up, Down, Left, Right
+Snap  g_from;                          // where a glide started
+int   g_travel = -1;                   // slot being travelled to, -1 = none
+float g_travelT = 0, g_travelDur = 0;
+int   g_bindHint = 0;                  // 0 none, 1 binding, 2 clearing
+constexpr float TRAVEL_RATE = 620.0f;  // map units a second, before clamping
+
+Snap captureSnap() {
+    Snap s;
+    s.set = true;
+    s.x = g_params.x.load();     s.y      = g_params.y.load();
+    s.bpm = g_params.bpm.load(); s.chaos  = g_params.chaos.load();
+    s.mode = g_params.mode.load(); s.rhythm = g_params.rhythm.load();
+    for (int i = 0; i < 3; ++i) {
+        s.dens[i] = g_params.dens[i].load(); s.len[i]  = g_params.len[i].load();
+        s.atk[i]  = g_params.atk[i].load();  s.rel[i]  = g_params.rel[i].load();
+        s.prob[i] = g_params.prob[i].load();
+    }
+    return s;
+}
+int mix(int a, int b, float t) { return int(std::lround(a + (b - a) * double(t))); }
+
+// Everything that can be ramped. x and y are handled by the caller, which owns
+// the puck's float position and has to keep the stick in step with it.
+void applySnapMix(const Snap& a, const Snap& b, float t) {
+    g_params.bpm.store(mix(a.bpm, b.bpm, t));
+    g_params.chaos.store(mix(a.chaos, b.chaos, t));
+    for (int i = 0; i < 3; ++i) {
+        g_params.dens[i].store(mix(a.dens[i], b.dens[i], t));
+        g_params.len[i].store(mix(a.len[i],  b.len[i],  t));
+        g_params.atk[i].store(mix(a.atk[i],  b.atk[i],  t));
+        g_params.rel[i].store(mix(a.rel[i],  b.rel[i],  t));
+        g_params.prob[i].store(mix(a.prob[i], b.prob[i], t));
+    }
+}
+
+// On a handheld the pad's own labels are right. On a desktop with no pad
+// attached they are a lie — the footer said "L1/R1 pick" at someone pressing
+// keys, which is exactly the hint they needed and could not use.
+bool g_padPresent = false;
+const char* btn(pad::Button b) {
+    if (g_padPresent) return pad::label(b);
+    switch (b) {
+        case pad::East:   return "Z";
+        case pad::South:  return "X";
+        case pad::North:  return "C";
+        case pad::West:   return "V";
+        case pad::L1:     return "1";
+        case pad::R1:     return "4";
+        case pad::L2:     return "2";
+        case pad::R2:     return "3";
+        case pad::L3:     return "E";
+        case pad::R3:     return "I";
+        case pad::Select: return "BKSP";
+        case pad::Start:  return "RET";
+        default:          return pad::label(b);
+    }
+}
+const char* slotName(int slot) {
+    static const char* n[4] = {"UP", "DOWN", "LEFT", "RIGHT"};
+    return (slot >= 0 && slot < 4) ? n[slot] : "";
+}
 
 int destSlot(pad::Button b) {
     switch (b) {
@@ -200,7 +268,7 @@ void destPip(int slot, float& dx, float& dy) {
     const float v[4][2] = {{0, -1}, {0, 1}, {-1, 0}, {1, 0}};
     dx = v[slot][0]; dy = v[slot][1];
 }
-void clearDests() { for (Dest& d : g_dest) d = Dest{}; g_travel = -1; }
+void clearDests() { for (Snap& d : g_dest) d = Snap{}; g_travel = -1; }
 
 // ── the topographic heat field ──
 // Static: the node set never changes, so the field is rasterized once into a
@@ -473,6 +541,17 @@ void draw(SDL_Renderer* r, const AudioOut& out, float dt) {
         gfx::textMid(r, Font::Small, p, hx + tw / 2, HUD_H / 2, P.phos, 0);
         hx += tw + su(6);
     }
+    if (g_travel >= 0) {
+        char t[32];
+        const float u = g_travelDur > 0 ? g_travelT / g_travelDur : 1.0f;
+        std::snprintf(t, sizeof t, "> %s %d%%", slotName(g_travel),
+                      int(std::lround((u > 1 ? 1 : u) * 100)));
+        const int tw = gfx::textWidth(Font::Small, t) + su(14);
+        gfx::fillRect(r, {hx, HUD_H / 2 - su(9), tw, su(18)}, P.amber);
+        gfx::textMid(r, Font::Small, t, hx + tw / 2, HUD_H / 2, P.screen, 0);
+        hx += tw + su(6);
+    }
+
     const char* tr = running ? "RUN" : "STOP";
     const int trw = gfx::textWidth(Font::Small, tr) + su(16);
     gfx::fillRect(r, {SCREEN_W - su(16) - trw, HUD_H / 2 - su(9), trw, su(18)},
@@ -495,14 +574,16 @@ void draw(SDL_Renderer* r, const AudioOut& out, float dt) {
     // footer
     const int fy = SCREEN_H - FOOTER_H;
     gfx::fillRect(r, {0, fy, SCREEN_W, FOOTER_H}, P.bg1);
-    const std::string row1 = std::string(pad::label(pad::East)) + " run   " +
-                             pad::label(pad::South) + " engine   " +
-                             pad::label(pad::North) + " rhythm   " +
-                             pad::label(pad::West) + " lane   L1/R1 pick   L2/R2 set";
-    const std::string row2 = std::string(pad::label(pad::L3)) + "+dir bind   " +
-                             pad::label(pad::R3) + "+dir clear   " +
-                             pad::label(pad::Select) + " reset   " +
-                             pad::label(pad::Start) + " quit";
+    const std::string row1 = std::string(btn(pad::East)) + " run   " +
+                             btn(pad::South) + " engine   " +
+                             btn(pad::North) + " rhythm   " +
+                             btn(pad::West) + " lane   " +
+                             btn(pad::L1) + "/" + btn(pad::R1) + " pick   " +
+                             btn(pad::L2) + "/" + btn(pad::R2) + " set";
+    const std::string row2 = std::string(btn(pad::L3)) + "+dir bind patch   " +
+                             btn(pad::R3) + "+dir clear   dir recall   " +
+                             btn(pad::Select) + " reset   " +
+                             btn(pad::Start) + " quit";
     gfx::textMid(r, Font::Small, row1, su(16), fy + FOOTER_H / 2 - su(8), P.txt1);
     gfx::textMid(r, Font::Small, row2, su(16), fy + FOOTER_H / 2 + su(8), P.txt2);
     if (out.deviceOpen()) {
@@ -579,6 +660,8 @@ int main(int argc, char** argv) {
     Window win;
     if (!win.open(wo)) return 1;
     buildField(win.renderer);
+    // with no pad attached the player is on the keyboard, so name the keys
+    g_padPresent = SDL_NumJoysticks() > 0;
 
     AudioOut out;
     const AudioOut::Settings set = AudioOut::loadSettings();
@@ -612,10 +695,17 @@ int main(int argc, char** argv) {
             g_cursor = s.cursor;
             clearDests();
             if (s.dests) {
-                g_dest[0] = {true,  58,  36};      // Up
-                g_dest[2] = {true,  34, 214};      // Left
-                g_dest[3] = {true, 232,  96};      // Right
-                g_travel = 3;                      // travelling to Right
+                Snap a = captureSnap(); a.x =  58; a.y =  36; g_dest[0] = a;
+                Snap b = captureSnap(); b.x =  34; b.y = 214; g_dest[2] = b;
+                Snap c = captureSnap(); c.x = 232; c.y =  96;
+                c.bpm = 180; c.chaos = 150;             // a patch, not a place
+                for (int i = 0; i < 3; ++i) { c.dens[i] = 90; c.rel[i] = 70; }
+                g_dest[3] = c;
+                g_from = captureSnap();
+                g_travel = 3; g_travelDur = 1.0f; g_travelT = 0.5f;
+                applySnapMix(g_from, c, 0.5f);          // caught mid-morph
+                g_params.x.store(mix(g_from.x, c.x, 0.5f));
+                g_params.y.store(mix(g_from.y, c.y, 0.5f));
             }
             if (!ctlLive(g_ctl[g_cursor])) moveCursor(1);
             if (s.run) {                       // let the engine put something on the grid
@@ -689,13 +779,30 @@ int main(int argc, char** argv) {
                         const int slot = destSlot(ev[i].b);
                         if (slot < 0) break;
                         if (st.down(pad::L3)) {
-                            g_dest[slot] = {true, g_params.x.load(), g_params.y.load()};
+                            g_dest[slot] = captureSnap();
                             g_travel = -1;
                         } else if (st.down(pad::R3)) {
-                            g_dest[slot] = Dest{};
+                            g_dest[slot] = Snap{};
                             if (g_travel == slot) g_travel = -1;
                         } else if (g_dest[slot].set) {
+                            const Snap& d = g_dest[slot];
+                            g_from = captureSnap();
                             g_travel = slot;
+                            g_travelT = 0;
+                            // a long hop takes longer, within reason
+                            const float dx = float(d.x - g_from.x), dy = float(d.y - g_from.y);
+                            const float dist = std::sqrt(dx * dx + dy * dy);
+                            g_travelDur = dist / TRAVEL_RATE;
+                            if (g_travelDur < 0.18f) g_travelDur = 0.18f;
+                            if (g_travelDur > 0.90f) g_travelDur = 0.90f;
+                            // the two switches cannot be interpolated: snap them
+                            // now, so the destination's engine carries the morph
+                            if (d.mode != g_from.mode) {
+                                g_params.mode.store(d.mode);
+                                g_engine.rewind();
+                            }
+                            g_params.rhythm.store(d.rhythm);
+                            if (!ctlLive(g_ctl[g_cursor])) moveCursor(1);
                         }
                         break;
                     }
@@ -723,17 +830,17 @@ int main(int argc, char** argv) {
         puckX += st.lx * speed * dt;
         puckY -= st.ly * speed * dt;   // stick y is positive up; the map is not
         if (g_travel >= 0) {
-            const Dest& d = g_dest[g_travel];
-            const float ddx = float(d.x) - puckX, ddy = float(d.y) - puckY;
-            const float dist = std::sqrt(ddx * ddx + ddy * ddy);
-            const float stepLen = TRAVEL_RATE * dt;
-            if (dist <= stepLen) {
-                puckX = float(d.x);
-                puckY = float(d.y);
+            const Snap& d = g_dest[g_travel];
+            g_travelT += dt;
+            float u = g_travelDur > 0 ? g_travelT / g_travelDur : 1.0f;
+            if (u > 1.0f) u = 1.0f;
+            const float e = u * u * (3.0f - 2.0f * u);     // ease in and out
+            puckX = float(g_from.x) + (float(d.x) - float(g_from.x)) * e;
+            puckY = float(g_from.y) + (float(d.y) - float(g_from.y)) * e;
+            applySnapMix(g_from, d, e);
+            if (u >= 1.0f) {
                 g_travel = -1;
-            } else {
-                puckX += ddx / dist * stepLen;
-                puckY += ddy / dist * stepLen;
+                if (!ctlLive(g_ctl[g_cursor])) moveCursor(1);
             }
         } else if (!g_bindHint) {
             if (st.down(pad::Left)  && !g_dest[2].set) puckX -= speed * dt;
