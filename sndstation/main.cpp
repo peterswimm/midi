@@ -5,6 +5,7 @@
 // gamepad on a 640x480 panel instead of a mouse on a web page.
 //
 //   gritty-grids               run it
+//   gritty-grids --dark        the demo's phosphor palette instead of paper
 //   gritty-grids --res WxH     force the layout size (development)
 //   gritty-grids --shots DIR   headless: write one frame per screen, then exit
 //   gritty-grids --bench SEC   headless: render SEC seconds of audio, report cost
@@ -24,11 +25,65 @@ using namespace gritty;
 
 namespace {
 
-// ── the phosphor screen, lifted from the demo's CSS ──
-constexpr SDL_Color PHOS   {0x7D, 0xFB, 0xA0, 255};
-constexpr SDL_Color PHOS_D {0x39, 0xC4, 0x6E, 255};
-constexpr SDL_Color AMBER  {0xFF, 0xB3, 0x47, 255};
-constexpr SDL_Color SCREEN {0x06, 0x0D, 0x0A, 255};
+// ── the palette ──
+// Every colour the app draws with lives here, including the sndstation theme
+// tokens it would otherwise take straight from theme.h — the SDK's own tokens
+// are a dark theme (bg0 is #0C0D0F), so a light look has to override them too.
+//
+// Light is the default. A handheld is used in daylight as often as not, and
+// the demo's CRT green reads as a screenshot of a screenshot once it is on a
+// real panel. --dark restores the demo's phosphor exactly.
+struct Pal {
+    SDL_Color screen;      // the map ground and the scope wells
+    SDL_Color phos;        // strongest accent: live text, the puck, a flash
+    SDL_Color phosD;       // mid accent: a hit, a selected chip, RUN
+    SDL_Color amber;       // hot accent: the dominant node, accents, X/Y
+    SDL_Color bg0;         // window
+    SDL_Color bg1;         // chrome: HUD, footer, the lane grids' ground
+    SDL_Color bg2;         // an inactive chip
+    SDL_Color line;        // hairlines and cell frames
+    SDL_Color txt0, txt1, txt2;
+    SDL_Color warn;
+    float     heat[3][3];  // the map's height ramp: ground, mid, peak
+};
+
+// Paper and ink. The accents keep the demo's hues and drop their value so
+// they carry on a light ground; on dark, "more emphasis" means brighter, and
+// here it means darker, so phos is the deepest green rather than the palest.
+constexpr Pal PAL_LIGHT {
+    {0xFA, 0xF8, 0xF2, 255},
+    {0x0F, 0x6B, 0x38, 255},
+    {0x2E, 0x96, 0x55, 255},
+    {0xB2, 0x5E, 0x0E, 255},
+    {0xF4, 0xF1, 0xE8, 255},
+    {0xE7, 0xE3, 0xD7, 255},
+    {0xD3, 0xCE, 0xBF, 255},
+    {0xB2, 0xAB, 0x99, 255},
+    {0x1E, 0x1C, 0x18, 255},
+    {0x45, 0x42, 0x3A, 255},
+    {0x7A, 0x74, 0x67, 255},
+    {0xA8, 0x3A, 0x0A, 255},
+    {{232, 236, 229}, {126, 188, 146}, {226, 142, 48}},
+};
+
+// The demo's CSS, unchanged: --phos, --phos-deep, --amber, and its screen.
+constexpr Pal PAL_DARK {
+    {0x06, 0x0D, 0x0A, 255},
+    {0x7D, 0xFB, 0xA0, 255},
+    {0x39, 0xC4, 0x6E, 255},
+    {0xFF, 0xB3, 0x47, 255},
+    {0x0C, 0x0D, 0x0F, 255},
+    {0x14, 0x16, 0x1A, 255},
+    {0x1D, 0x20, 0x25, 255},
+    {0x2A, 0x2E, 0x33, 255},
+    {0xE8, 0xE4, 0xDC, 255},
+    {0x8A, 0x8F, 0x98, 255},
+    {0x56, 0x5B, 0x63, 255},
+    {0xFF, 0xB3, 0x00, 255},
+    {{6, 13, 10}, {31, 107, 63}, {255, 179, 71}},
+};
+
+Pal P = PAL_LIGHT;
 
 Params  g_params;
 Meters  g_meters;
@@ -113,6 +168,40 @@ std::string ctlValue(const Ctl& c) {
     }
 }
 
+// ── destinations on the D-pad ──
+// The D-pad starts out as a slow nudge, which is what you want while the map
+// is unfamiliar. Once you know where the good patterns are, the four
+// directions become waypoints: hold L3 and press a direction to bind the
+// puck's current position to it, and from then on that direction travels
+// there instead of nudging. L3 was free, and so was R3, which unbinds.
+//
+// Travel is a glide, not a jump. Sweeping through the intermediate blends is
+// most of what the map is for, and cutting straight to the destination throws
+// away the part worth hearing. The stick interrupts a glide at any point, so
+// the waypoint is a starting gesture rather than a mode you are stuck in.
+struct Dest { bool set = false; int x = 0, y = 0; };
+Dest g_dest[4];                        // Up, Down, Left, Right
+int  g_travel = -1;                    // slot being travelled to, -1 = none
+int  g_bindHint = 0;                   // 0 none, 1 binding, 2 clearing
+constexpr float TRAVEL_RATE = 620.0f;  // map units a second (255 in ~0.4s)
+
+int destSlot(pad::Button b) {
+    switch (b) {
+        case pad::Up:    return 0;
+        case pad::Down:  return 1;
+        case pad::Left:  return 2;
+        case pad::Right: return 3;
+        default:         return -1;
+    }
+}
+// Which way the marker's pip sits off its centre. Open Sans has no arrow
+// glyphs at this size, so the direction is drawn rather than typed.
+void destPip(int slot, float& dx, float& dy) {
+    const float v[4][2] = {{0, -1}, {0, 1}, {-1, 0}, {1, 0}};
+    dx = v[slot][0]; dy = v[slot][1];
+}
+void clearDests() { for (Dest& d : g_dest) d = Dest{}; g_travel = -1; }
+
 // ── the topographic heat field ──
 // Static: the node set never changes, so the field is rasterized once into a
 // texture and blitted. Only the puck on top of it moves.
@@ -130,7 +219,7 @@ float scalarAt(float gx, float gy) {
     return top + (bot - top) * fy;
 }
 void heatRamp(float s, float& r, float& g, float& b) {
-    const float c0[3] = {6, 13, 10}, c1[3] = {31, 107, 63}, c2[3] = {255, 179, 71};
+    const float* c0 = P.heat[0]; const float* c1 = P.heat[1]; const float* c2 = P.heat[2];
     const float* a; const float* z; float f;
     if (s < 0.6f) { a = c0; z = c1; f = s / 0.6f; }
     else          { a = c1; z = c2; f = (s - 0.6f) / 0.4f; }
@@ -162,15 +251,15 @@ void drawMap(SDL_Renderer* r, int bx, int by, int size) {
     using namespace theme;
     const Corners c = cornersAt(g_params.x.load(), g_params.y.load());
     const SDL_Rect dst{bx, by, size, size};
-    gfx::fillRect(r, dst, SCREEN);
+    gfx::fillRect(r, dst, P.screen);
     if (g_field) gfx::blit(r, g_field, nullptr, &dst);
-    gfx::frameRect(r, dst, line);
+    gfx::frameRect(r, dst, P.line);
 
     // the 25 nodes
     for (int gy = 0; gy < 5; ++gy)
         for (int gx = 0; gx < 5; ++gx)
             gfx::disc(r, float(bx) + gx / 4.0f * size, float(by) + gy / 4.0f * size,
-                      suf(1.8f), withAlpha(PHOS, 90));
+                      suf(1.8f), withAlpha(P.phos, 150));
 
     // the four that are actually sounding, sized by weight
     for (int k = 0; k < 4; ++k) {
@@ -178,17 +267,40 @@ void drawMap(SDL_Renderer* r, int bx, int by, int size) {
         const int n = c.idx[k];
         const float gx = float(n % 5), gy = float(n / 5);
         gfx::disc(r, float(bx) + gx / 4.0f * size, float(by) + gy / 4.0f * size,
-                  suf(2.0f + 4.0f * c.w[k]), withAlpha(AMBER, Uint8(80 + 175 * c.w[k])));
+                  suf(2.0f + 4.0f * c.w[k]), withAlpha(P.amber, Uint8(80 + 175 * c.w[k])));
+    }
+
+    // bound destinations, drawn under the puck
+    for (int k = 0; k < 4; ++k) {
+        if (!g_dest[k].set) continue;
+        const float dx = float(bx) + g_dest[k].x / 255.0f * size;
+        const float dy = float(by) + g_dest[k].y / 255.0f * size;
+        const bool  going = k == g_travel;
+        const SDL_Color ink = going ? P.amber : P.phos;
+        float ox, oy; destPip(k, ox, oy);
+        gfx::disc(r, dx, dy, suf(7.0f), ink);
+        gfx::disc(r, dx, dy, suf(5.2f), P.screen);
+        gfx::disc(r, dx + ox * suf(7.0f), dy + oy * suf(7.0f), suf(2.6f), ink);
+    }
+
+    // while a bind is armed, say so over the map rather than in the footer
+    if (g_bindHint) {
+        const char* msg = g_bindHint == 1 ? "press a direction to bind this spot"
+                                          : "press a direction to clear it";
+        const int th = su(16);
+        gfx::fillRect(r, {bx, by + size - th, size, th}, P.bg1);
+        gfx::textMid(r, Font::Small, msg, bx + size / 2, by + size - th / 2,
+                     g_bindHint == 1 ? P.phos : P.amber, 0);
     }
 
     // crosshair + puck
     const float px = float(bx) + g_params.x.load() / 255.0f * size;
     const float py = float(by) + g_params.y.load() / 255.0f * size;
-    gfx::fillRect(r, {int(px), by, 1, size}, withAlpha(PHOS, 70));
-    gfx::fillRect(r, {bx, int(py), size, 1}, withAlpha(PHOS, 70));
-    gfx::glow(r, px, py, suf(13), withAlpha(PHOS, 110));
-    gfx::disc(r, px, py, suf(7), PHOS);
-    gfx::disc(r, px, py, suf(2.6f), SCREEN);
+    gfx::fillRect(r, {int(px), by, 1, size}, withAlpha(P.phos, 70));
+    gfx::fillRect(r, {bx, int(py), size, 1}, withAlpha(P.phos, 70));
+    gfx::glow(r, px, py, suf(13), withAlpha(P.phos, 110));
+    gfx::disc(r, px, py, suf(7), P.phos);
+    gfx::disc(r, px, py, suf(2.6f), P.screen);
 }
 
 void drawBlend(SDL_Renderer* r, int bx, int by, int w) {
@@ -200,12 +312,12 @@ void drawBlend(SDL_Renderer* r, int bx, int by, int w) {
 
     char hdr[64];
     std::snprintf(hdr, sizeof hdr, "node %d \xC2\xB7 %s", dom, N[dom].author);
-    gfx::textMid(r, Font::Small, hdr, bx, by + su(6), txt2);
-    gfx::textMid(r, Font::Label, N[dom].expr, bx, by + su(24), PHOS);
+    gfx::textMid(r, Font::Small, hdr, bx, by + su(6), P.txt2);
+    gfx::textMid(r, Font::Label, N[dom].expr, bx, by + su(24), P.phos);
 
     char coord[32];
     std::snprintf(coord, sizeof coord, "X %d \xC2\xB7 Y %d", X, Y);
-    gfx::textMid(r, Font::Small, coord, bx + w, by + su(6), AMBER, 1);
+    gfx::textMid(r, Font::Small, coord, bx + w, by + su(6), P.amber, 1);
 
     // the blend, heaviest corner first
     int ord[4] = {0, 1, 2, 3};
@@ -221,16 +333,16 @@ void drawBlend(SDL_Renderer* r, int bx, int by, int w) {
         const bool  isDom = ni == dom;
         char tag[16];
         std::snprintf(tag, sizeof tag, "n%d", ni);
-        gfx::textMid(r, Font::Small, tag, bx, y + su(7), isDom ? AMBER : txt2);
+        gfx::textMid(r, Font::Small, tag, bx, y + su(7), isDom ? P.amber : P.txt2);
         gfx::textMid(r, Font::Small, N[ni].expr, bx + su(26), y + su(7),
-                     isDom ? txt0 : txt1);
+                     isDom ? P.txt0 : P.txt1);
         char p[8];
         std::snprintf(p, sizeof p, "%d%%", pct);
-        gfx::textMid(r, Font::Small, p, bx + w, y + su(7), isDom ? AMBER : txt1, 1);
+        gfx::textMid(r, Font::Small, p, bx + w, y + su(7), isDom ? P.amber : P.txt1, 1);
         const int barW = w - su(26);
-        gfx::fillRect(r, {bx + su(26), y + su(16), barW, su(3)}, bg2);
+        gfx::fillRect(r, {bx + su(26), y + su(16), barW, su(3)}, P.bg2);
         gfx::fillRect(r, {bx + su(26), y + su(16), barW * pct / 100, su(3)},
-                      isDom ? AMBER : PHOS_D);
+                      isDom ? P.amber : P.phosD);
         y += su(26);
     }
 }
@@ -250,8 +362,8 @@ void drawLanes(SDL_Renderer* r, int bx, int by, int w, float dt) {
     for (int vi = 0; vi < 3; ++vi) {
         const int y = by + vi * rowH;
         gfx::textMid(r, Font::Label, laneName(vi), bx, y + su(9),
-                     g_ctl[g_cursor].lane == vi ? PHOS : txt1);
-        gfx::textMid(r, Font::Small, laneRole(vi, mode), bx, y + su(21), txt2);
+                     g_ctl[g_cursor].lane == vi ? P.phos : P.txt1);
+        gfx::textMid(r, Font::Small, laneRole(vi, mode), bx, y + su(21), P.txt2);
 
         const int Ln   = g_params.laneLen(vi);
         const float dens = float(g_params.dens[vi].load());
@@ -291,27 +403,27 @@ void drawLanes(SDL_Renderer* r, int bx, int by, int w, float dt) {
             }
             const bool cand = rhythm == Rhythm::Roles && candidate(vi, s);
             const bool beat = rhythm == Rhythm::Roles && s % 4 == 0;
-            SDL_Color fill = bg1;
-            if (cand) fill = bg2;
-            if (on)   fill = (L > 212.0f) ? AMBER : PHOS_D;
-            if (g_flash[vi].t > 0 && g_flash[vi].idx == s) fill = PHOS;
+            SDL_Color fill = P.bg1;
+            if (cand) fill = P.bg2;
+            if (on)   fill = (L > 212.0f) ? P.amber : P.phosD;
+            if (g_flash[vi].t > 0 && g_flash[vi].idx == s) fill = P.phos;
             gfx::fillRect(r, cell, fill);
-            if (beat) gfx::fillRect(r, {cell.x, cell.y, su(2), cell.h}, withAlpha(PHOS, 60));
-            gfx::frameRect(r, cell, s == ph ? PHOS : line);
+            if (beat) gfx::fillRect(r, {cell.x, cell.y, su(2), cell.h}, withAlpha(P.phos, 60));
+            gfx::frameRect(r, cell, s == ph ? P.phos : P.line);
         }
 
         // Bit voice: the lane's own 1-bit trace, to the right of its steps.
         if (mode == Mode::Voice) {
             const int sx = cellsX + cellsW + su(8), sw = su(80), sh = su(18);
-            gfx::fillRect(r, {sx, y + su(4), sw, sh}, SCREEN);
+            gfx::fillRect(r, {sx, y + su(4), sw, sh}, P.screen);
             const int start = g_meters.scopePtr[vi].load();
             for (int j = 0; j < sw; ++j) {
                 const int   si = (start + j * SCOPE_N / sw) & (SCOPE_N - 1);
                 const float v  = g_meters.scope[vi][si];
                 const int   yy = y + su(4) + int(v > 0 ? sh * 0.26f : sh * 0.74f);
-                gfx::fillRect(r, {sx + j, yy, 1, su(2)}, PHOS);
+                gfx::fillRect(r, {sx + j, yy, 1, su(2)}, P.phos);
             }
-            gfx::frameRect(r, {sx, y + su(4), sw, sh}, line);
+            gfx::frameRect(r, {sx, y + su(4), sw, sh}, P.line);
         }
     }
 }
@@ -319,7 +431,7 @@ void drawLanes(SDL_Renderer* r, int bx, int by, int w, float dt) {
 void drawStrip(SDL_Renderer* r, int bx, int by, int w) {
     using namespace theme;
     const int focusLane = g_ctl[g_cursor].lane;
-    gfx::fillRect(r, {bx, by, w, su(26)}, bg1);
+    gfx::fillRect(r, {bx, by, w, su(26)}, P.bg1);
 
     int x = bx + su(6);
     for (int i = 0; i < g_nCtl; ++i) {
@@ -332,42 +444,42 @@ void drawStrip(SDL_Renderer* r, int bx, int by, int w) {
         else            std::snprintf(label, sizeof label, "%s %s", c.label, ctlValue(c).c_str());
         const int tw = gfx::textWidth(Font::Small, label) + su(14);
         if (x + tw > bx + w) break;
-        gfx::fillRect(r, {x, by + su(3), tw, su(20)}, sel ? PHOS_D : bg2);
-        gfx::textMid(r, Font::Small, label, x + tw / 2, by + su(13), sel ? SCREEN : txt1, 0);
+        gfx::fillRect(r, {x, by + su(3), tw, su(20)}, sel ? P.phosD : P.bg2);
+        gfx::textMid(r, Font::Small, label, x + tw / 2, by + su(13), sel ? P.screen : P.txt1, 0);
         x += tw + su(5);
     }
     if (focusLane >= 0) {
-        gfx::textMid(r, Font::Small, laneName(focusLane), bx + w - su(6), by + su(13), AMBER, 1);
+        gfx::textMid(r, Font::Small, laneName(focusLane), bx + w - su(6), by + su(13), P.amber, 1);
     }
 }
 
 void draw(SDL_Renderer* r, const AudioOut& out, float dt) {
     using namespace theme;
-    gfx::clear(r, bg0);
+    gfx::clear(r, P.bg0);
 
     const Mode   mode    = Mode(g_params.mode.load());
     const Rhythm rhythm  = Rhythm(g_params.rhythm.load());
     const bool   running = g_params.playing.load();
 
     // HUD
-    gfx::fillRect(r, {0, 0, SCREEN_W, HUD_H}, bg1);
-    gfx::textMid(r, Font::Title, "GRITTY GRIDS", su(16), HUD_H / 2, txt0);
+    gfx::fillRect(r, {0, 0, SCREEN_W, HUD_H}, P.bg1);
+    gfx::textMid(r, Font::Title, "GRITTY GRIDS", su(16), HUD_H / 2, P.txt0);
     int hx = su(16) + gfx::textWidth(Font::Title, "GRITTY GRIDS") + su(14);
     const char* pills[2] = {mode == Mode::Voice ? "BIT VOICE" : "BITSEQ",
                             rhythm == Rhythm::Formula ? "FORMULA" : "ROLES"};
     for (const char* p : pills) {
         const int tw = gfx::textWidth(Font::Small, p) + su(14);
-        gfx::fillRect(r, {hx, HUD_H / 2 - su(9), tw, su(18)}, bg2);
-        gfx::textMid(r, Font::Small, p, hx + tw / 2, HUD_H / 2, PHOS, 0);
+        gfx::fillRect(r, {hx, HUD_H / 2 - su(9), tw, su(18)}, P.bg2);
+        gfx::textMid(r, Font::Small, p, hx + tw / 2, HUD_H / 2, P.phos, 0);
         hx += tw + su(6);
     }
     const char* tr = running ? "RUN" : "STOP";
     const int trw = gfx::textWidth(Font::Small, tr) + su(16);
     gfx::fillRect(r, {SCREEN_W - su(16) - trw, HUD_H / 2 - su(9), trw, su(18)},
-                  running ? PHOS_D : bg2);
+                  running ? P.phosD : P.bg2);
     gfx::textMid(r, Font::Small, tr, SCREEN_W - su(16) - trw / 2, HUD_H / 2,
-                 running ? SCREEN : txt2, 0);
-    gfx::hline(r, 0, HUD_H, SCREEN_W, line);
+                 running ? P.screen : P.txt2, 0);
+    gfx::hline(r, 0, HUD_H, SCREEN_W, P.line);
 
     // the map, and what it is blending
     const int mapSize = su(188);
@@ -382,21 +494,24 @@ void draw(SDL_Renderer* r, const AudioOut& out, float dt) {
 
     // footer
     const int fy = SCREEN_H - FOOTER_H;
-    gfx::fillRect(r, {0, fy, SCREEN_W, FOOTER_H}, bg1);
-    std::string hint = std::string(pad::label(pad::East)) + " run   " +
-                       pad::label(pad::South) + " engine   " +
-                       pad::label(pad::North) + " rhythm   " +
-                       pad::label(pad::West) + " lane   L1/R1 pick   L2/R2 set   " +
-                       pad::label(pad::Select) + " reset   " +
-                       pad::label(pad::Start) + " quit";
-    gfx::textMid(r, Font::Small, hint, su(16), fy + FOOTER_H / 2, txt1);
+    gfx::fillRect(r, {0, fy, SCREEN_W, FOOTER_H}, P.bg1);
+    const std::string row1 = std::string(pad::label(pad::East)) + " run   " +
+                             pad::label(pad::South) + " engine   " +
+                             pad::label(pad::North) + " rhythm   " +
+                             pad::label(pad::West) + " lane   L1/R1 pick   L2/R2 set";
+    const std::string row2 = std::string(pad::label(pad::L3)) + "+dir bind   " +
+                             pad::label(pad::R3) + "+dir clear   " +
+                             pad::label(pad::Select) + " reset   " +
+                             pad::label(pad::Start) + " quit";
+    gfx::textMid(r, Font::Small, row1, su(16), fy + FOOTER_H / 2 - su(8), P.txt1);
+    gfx::textMid(r, Font::Small, row2, su(16), fy + FOOTER_H / 2 + su(8), P.txt2);
     if (out.deviceOpen()) {
         char a[48];
         std::snprintf(a, sizeof a, "%d Hz \xC2\xB7 %d", out.sampleRate(), out.deviceFrames());
-        gfx::textMid(r, Font::Small, a, SCREEN_W - su(16), fy + FOOTER_H / 2, txt2, 1);
+        gfx::textMid(r, Font::Small, a, SCREEN_W - su(16), fy + FOOTER_H / 2, P.txt2, 1);
     } else {
         gfx::textMid(r, Font::Small, "no audio device", SCREEN_W - su(16),
-                     fy + FOOTER_H / 2, warn, 1);
+                     fy + FOOTER_H / 2, P.warn, 1);
     }
 }
 
@@ -453,6 +568,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if      (!std::strcmp(argv[i], "--shots") && i + 1 < argc) shots = argv[++i];
         else if (!std::strcmp(argv[i], "--bench") && i + 1 < argc) benchSec = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--dark")) P = PAL_DARK;
         else if (!std::strcmp(argv[i], "--res")   && i + 1 < argc)
             std::sscanf(argv[++i], "%dx%d", &wo.width, &wo.height);
     }
@@ -477,12 +593,14 @@ int main(int argc, char** argv) {
     if (wo.headless) {
         // One frame per screen state worth looking at, so a change to the
         // layout can be reviewed with no handheld and no display.
-        struct Shot { const char* name; Mode m; Rhythm r; bool run; int cursor; };
+        // dests: bind a few waypoints so the shot shows the markers, one of
+        // them mid-travel (amber) and the rest idle.
+        struct Shot { const char* name; Mode m; Rhythm r; bool run; int cursor; bool dests; };
         const Shot shots_[] = {
-            {"bitseq-roles",    Mode::Bitseq, Rhythm::Roles,   false, 0},
-            {"bitseq-formula",  Mode::Bitseq, Rhythm::Formula, true,  3},
-            {"voice-roles",     Mode::Voice,  Rhythm::Roles,   true,  6},
-            {"voice-formula",   Mode::Voice,  Rhythm::Formula, true,  11},
+            {"bitseq-roles",    Mode::Bitseq, Rhythm::Roles,   false, 0,  false},
+            {"bitseq-formula",  Mode::Bitseq, Rhythm::Formula, true,  3,  true},
+            {"voice-roles",     Mode::Voice,  Rhythm::Roles,   true,  6,  false},
+            {"voice-formula",   Mode::Voice,  Rhythm::Formula, true,  11, false},
         };
         int bad = 0;
         for (const Shot& s : shots_) {
@@ -492,6 +610,13 @@ int main(int argc, char** argv) {
             g_params.x.store(s.run ? 196 : 128);
             g_params.y.store(s.run ? 72  : 128);
             g_cursor = s.cursor;
+            clearDests();
+            if (s.dests) {
+                g_dest[0] = {true,  58,  36};      // Up
+                g_dest[2] = {true,  34, 214};      // Left
+                g_dest[3] = {true, 232,  96};      // Right
+                g_travel = 3;                      // travelling to Right
+            }
             if (!ctlLive(g_ctl[g_cursor])) moveCursor(1);
             if (s.run) {                       // let the engine put something on the grid
                 static float b[512];
@@ -559,8 +684,24 @@ int main(int argc, char** argv) {
                     case pad::R1: moveCursor(+1); break;
                     case pad::L2: nudge(-1, 1); heldDir = -1; held = 0; break;
                     case pad::R2: nudge(+1, 1); heldDir = +1; held = 0; break;
+                    case pad::Up: case pad::Down:
+                    case pad::Left: case pad::Right: {        // destinations
+                        const int slot = destSlot(ev[i].b);
+                        if (slot < 0) break;
+                        if (st.down(pad::L3)) {
+                            g_dest[slot] = {true, g_params.x.load(), g_params.y.load()};
+                            g_travel = -1;
+                        } else if (st.down(pad::R3)) {
+                            g_dest[slot] = Dest{};
+                            if (g_travel == slot) g_travel = -1;
+                        } else if (g_dest[slot].set) {
+                            g_travel = slot;
+                        }
+                        break;
+                    }
                     case pad::Select:                             // back to the defaults
                         g_params.reset();
+                        clearDests();
                         puckX = float(g_params.x.load());
                         puckY = float(g_params.y.load());
                         break;
@@ -574,14 +715,32 @@ int main(int argc, char** argv) {
         last = now;
         pad::update(st, dt);
 
-        // the puck: stick is a velocity, D-pad is a step
+        // the puck: stick is a velocity, a D-pad direction is a step until
+        // something is bound to it, and then it is a glide to that spot
         const float speed = 150.0f;    // units per second at full deflection
+        g_bindHint = st.down(pad::L3) ? 1 : (st.down(pad::R3) ? 2 : 0);
+        if (std::fabs(st.lx) > 0.12f || std::fabs(st.ly) > 0.12f) g_travel = -1;
         puckX += st.lx * speed * dt;
         puckY -= st.ly * speed * dt;   // stick y is positive up; the map is not
-        if (st.down(pad::Left))  puckX -= speed * dt;
-        if (st.down(pad::Right)) puckX += speed * dt;
-        if (st.down(pad::Up))    puckY -= speed * dt;
-        if (st.down(pad::Down))  puckY += speed * dt;
+        if (g_travel >= 0) {
+            const Dest& d = g_dest[g_travel];
+            const float ddx = float(d.x) - puckX, ddy = float(d.y) - puckY;
+            const float dist = std::sqrt(ddx * ddx + ddy * ddy);
+            const float stepLen = TRAVEL_RATE * dt;
+            if (dist <= stepLen) {
+                puckX = float(d.x);
+                puckY = float(d.y);
+                g_travel = -1;
+            } else {
+                puckX += ddx / dist * stepLen;
+                puckY += ddy / dist * stepLen;
+            }
+        } else if (!g_bindHint) {
+            if (st.down(pad::Left)  && !g_dest[2].set) puckX -= speed * dt;
+            if (st.down(pad::Right) && !g_dest[3].set) puckX += speed * dt;
+            if (st.down(pad::Up)    && !g_dest[0].set) puckY -= speed * dt;
+            if (st.down(pad::Down)  && !g_dest[1].set) puckY += speed * dt;
+        }
         puckX = puckX < 0 ? 0 : (puckX > 255 ? 255 : puckX);
         puckY = puckY < 0 ? 0 : (puckY > 255 ? 255 : puckY);
         g_params.x.store(int(puckX + 0.5f));

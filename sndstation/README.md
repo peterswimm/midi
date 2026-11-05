@@ -19,8 +19,10 @@ ratchets, and Chaos.
 ![Bitseq with the Formula rhythm source](docs/bitseq-formula.png)
 
 *Bitseq, Formula rhythm: the puck sits between four programs, the readout names them and
-their weights, and the three tracks are running at 16 / 12 / 9.
-([Bit voice](docs/voice-formula.png) adds a 1-bit trace per lane.)*
+their weights, and the three tracks are running at 16 / 12 / 9. The three rings on the map
+are destinations bound to D-pad directions — the amber one is being travelled to.
+([Bit voice](docs/voice-formula.png) adds a 1-bit trace per lane;
+[`--dark`](docs/bitseq-formula-dark.png) is the demo's phosphor.)*
 
 ## What it is
 
@@ -52,22 +54,38 @@ The puck is the instrument; everything else is a modifier.
 | | |
 |---|---|
 | **Left stick** | move the puck — this is the whole gesture |
-| **D-pad** | move the puck, slower |
+| **D-pad** | move the puck, slower — until a destination is bound to that direction |
+| **L3 + a direction** | bind the puck's spot to that D-pad direction |
+| **R3 + a direction** | unbind it |
 | **A** | Run / Stop (a run always starts at pulse 0) |
 | **B** | engine: Bitseq / Bit voice |
 | **X** | rhythm source: Roles / Formula |
 | **Y** | jump to the next lane's controls |
 | **L1 / R1** | pick a control |
 | **L2 / R2** | change it — hold to repeat, and it coarsens the longer you hold |
-| **SELECT** | back to the defaults |
+| **SELECT** | back to the defaults, and clear the destinations |
 | **START** | quit (back to the launcher on a handheld) |
+
+### Destinations
+
+The D-pad nudges the puck, which is what you want while the map is unfamiliar. Once you
+know where the good patterns are, the four directions can hold them: hold **L3** and press
+a direction to bind the puck's current position to it, and that direction travels there
+from then on. **R3** and a direction unbinds it. Bound spots show on the map as rings
+with a pip on the side they answer to, amber while one is being travelled to.
+
+Travel is a glide, not a jump — sweeping through the intermediate blends is most of what
+the map is for, and cutting straight there throws away the part worth hearing. The stick
+interrupts a glide at any point, so a destination is a gesture you start rather than a
+mode you are stuck in. Destinations live in the session; nothing is written to disk.
 
 Controls the current mode has no use for are skipped: **L** (track length) only exists
 in Formula, **P** only in Bit voice, exactly as the web demo hides them. **D** is density
 in Bitseq and pitch in Bit voice, and reads out in the right units for each.
 
-On a desktop the keyboard is a full pad (sndstation's own fallback: arrows, Z/X, Return,
-Backspace).
+On a desktop the keyboard is a full pad (sndstation's own fallback): arrows for the
+D-pad, **Z** and **X** for A and B, **C** and **V** for X and Y, **1**/**4** for L1/R1,
+**2**/**3** for L2/R2, **E** and **I** for L3/R3, **Backspace** reset, **Return** quit.
 
 ## Building
 
@@ -98,6 +116,7 @@ what to do about it, rather than at link time.
 
 | | |
 |---|---|
+| `--dark` | the demo's phosphor palette instead of the default paper one |
 | `--res WxH` | force the layout size |
 | `--shots DIR` | headless: write one BMP per screen state (both engines x both rhythm sources) and exit. No display needed. |
 | `--bench SEC` | headless: render SEC seconds of audio through both engines with the puck sweeping the map, and report cost, level and clipping. No display, no device. |
@@ -163,7 +182,8 @@ the more correct of the two and nobody will hear the difference.
 
 ## How the port differs from the demo
 
-Three changes, all forced by the platform or by the demo being wrong:
+Four changes, forced by the platform, by the demo being wrong, or by a handheld not
+being a browser window:
 
 1. **One clock instead of two.** WebAudio let the demo schedule Bitseq hits as buffers a
    tenth of a second ahead while Bit voice ran in a ScriptProcessor. sndstation gives an
@@ -177,6 +197,11 @@ Three changes, all forced by the platform or by the demo being wrong:
    pattern while the engine gates on the role (or a fixed half-range threshold) and
    ignores density entirely — that control is pitch in Bit voice. Here the grid is drawn
    from the same rule the engine uses, so what is lit is what you hear.
+4. **Paper, not phosphor, by default.** The demo is a dark CRT because it lives in a
+   browser tab at night. A handheld goes outside, where a dark screen with thin bright
+   green text is the worst case for a cheap panel in daylight, so the default palette is
+   dark ink on paper and the accents keep the demo's hues at a value that carries on it.
+   `--dark` is the demo's CSS exactly, for the times the room is dark.
 
 The map, the blend, the thresholds, the envelopes, the probability curve, the ratchet
 ladder, the kick's pitch drop and the 1-bit grit are all the demo's own numbers.
