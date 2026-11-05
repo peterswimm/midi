@@ -123,6 +123,83 @@ inline Corners cornersAt(int X, int Y) {
     c.w[2] = (1 - c.fx) * c.fy;       c.w[3] = c.fx * c.fy;
     return c;
 }
+// ── the blend: between nodes, which program's byte do you hear? ──
+//
+// The first model here was a weighted average of the four corners' bytes.
+// That is wrong in a way that matters. A bytebeat byte is a BIT PATTERN, not
+// a sample on a continuum: the music is in `&`, `|`, `^` and the carries of a
+// multiply. Averaging four unrelated programs lands between every pattern and
+// on none of them, and the arithmetic character -- the thing that makes these
+// one-liners sound like anything -- averages away first. Four distinct drum
+// programs average to a wash.
+//
+// So the blend no longer invents a byte. It CHOOSES one, per tick, from a
+// real program, with each corner winning ticks in proportion to its bilinear
+// weight. Over a beat you hear the mixture; over a single tick you always
+// hear one authentic byte. That is how Grids itself blends -- by probability,
+// not by averaging -- and it is what a bytebeat remix does by hand.
+//
+// The choice is made with the van der Corput sequence (the bit-reversal of
+// the tick index) rather than a random number. Equidistribution is the whole
+// point: white noise clumps, and a clump is an audible stutter of one program
+// where the weights promised a mixture. Bit-reversal spreads consecutive
+// ticks as evenly as the weights allow, and being a pure function of `t` it
+// is deterministic -- the same map position sounds the same every time, and
+// can be tested.
+enum class Blend { Dither = 0, Nearest = 1, Mean = 2 };
+inline const char* blendName(int b) {
+    switch (b) { case 1: return "NEAR"; case 2: return "MEAN"; default: return "DITH"; }
+}
+
+// A corner quieter than this is dropped rather than given a rare tick: one
+// byte in fifty from a program you are nowhere near is heard as a click, not
+// as a blend.
+constexpr float BLEND_EPS  = 0.02f;
+// At this weight a node plays alone, so every node sits in a plateau where
+// the formula is exactly itself and the map has 25 places that are honest.
+constexpr float BLEND_PURE = 0.92f;
+
+// The van der Corput sequence in base 2: the low 16 bits of `i`, reversed.
+inline float vdc16(int64_t i) {
+    uint32_t b = uint32_t(uint64_t(i)) & 0xFFFFu;
+    b = uint32_t(((b & 0x00FFu) << 8) | ((b & 0xFF00u) >> 8));
+    b = uint32_t(((b & 0x0F0Fu) << 4) | ((b & 0xF0F0u) >> 4));
+    b = uint32_t(((b & 0x3333u) << 2) | ((b & 0xCCCCu) >> 2));
+    b = uint32_t(((b & 0x5555u) << 1) | ((b & 0xAAAAu) >> 1));
+    return float(b) * (1.0f / 65536.0f);
+}
+
+// Which corner supplies the byte at tick `ti`.
+inline int blendPick(const Corners& c, int64_t ti) {
+    int best = 0;
+    for (int k = 1; k < 4; ++k) if (c.w[k] > c.w[best]) best = k;
+    if (c.w[best] >= BLEND_PURE) return best;
+    float w[4], tot = 0;
+    for (int k = 0; k < 4; ++k) { w[k] = c.w[k] < BLEND_EPS ? 0.0f : c.w[k]; tot += w[k]; }
+    if (tot <= 0) return best;
+    const float u = vdc16(ti) * tot;
+    float cum = 0;
+    for (int k = 0; k < 4; ++k) { cum += w[k]; if (u < cum) return k; }
+    return best;
+}
+
+// The blended byte at tick `ti`. Dither and Nearest both return a byte some
+// program actually produced; Mean is the old average, kept because the
+// difference is the point and has to stay audible.
+inline float blendByte(const Corners& c, int64_t ti, int bmode) {
+    if (bmode == int(Blend::Mean)) {
+        float v = 0;
+        for (int k = 0; k < 4; ++k) v += c.w[k] * float(sample(c.idx[k], ti));
+        return v;
+    }
+    if (bmode == int(Blend::Nearest)) {
+        int best = 0;
+        for (int k = 1; k < 4; ++k) if (c.w[k] > c.w[best]) best = k;
+        return float(sample(c.idx[best], ti));
+    }
+    return float(sample(c.idx[blendPick(c, ti)], ti));
+}
+
 inline float levelAt(const Corners& c, int lane, int step) {
     const Curves& cv = curves();
     float L = 0;
@@ -172,6 +249,7 @@ struct Params {
     std::atomic<int>  freeRun[3];                  // 1 = no sequencer, the formula plays
     std::atomic<int>  key[3];                      // free lane transpose, semitones
     std::atomic<int>  chaos{30};                   // 0..200
+    std::atomic<int>  blend{int(Blend::Dither)};   // how the four corners mix
     std::atomic<int>  bpm{120};
     std::atomic<bool> playing{false};
     std::atomic<int>  mode{int(Mode::Bitseq)};
@@ -179,6 +257,7 @@ struct Params {
 
     Params() { reset(); }
     void reset() {
+        blend = int(Blend::Dither);
         x = 128; y = 128; chaos = 30; bpm = 120;
         for (int i = 0; i < 3; ++i) {
             dens[i] = DENS_DEF[i]; len[i] = LEN_DEF[i];
@@ -425,9 +504,7 @@ private:
                 const int64_t ti = int64_t(std::floor(m_vAcc[i]));
                 if (ti != m_vTi[i]) {
                     m_vTi[i] = ti;
-                    float val = 0;
-                    for (int k = 0; k < 4; ++k) val += c.w[k] * float(sample(c.idx[k], ti));
-                    m_vVal[i] = val;
+                    m_vVal[i] = blendByte(c, ti, P.blend.load());
                 }
                 if      (m_stage[i] == 1) { m_env[i] += aInc[i]; if (m_env[i] >= 1) { m_env[i] = 1; m_stage[i] = 2; } }
                 else if (m_stage[i] == 2) { m_env[i] -= rInc[i]; if (m_env[i] <= 0) { m_env[i] = 0; m_stage[i] = 0; } }
@@ -478,9 +555,7 @@ private:
         const int64_t ti = int64_t(std::floor(m_vAcc[i]));
         if (ti != m_vTi[i]) {
             m_vTi[i] = ti;
-            float v = 0;
-            for (int k = 0; k < 4; ++k) v += c.w[k] * float(sample(c.idx[k], ti));
-            m_vVal[i] = v;
+            m_vVal[i] = blendByte(c, ti, P.blend.load());
         }
         const float smp = (m_vVal[i] - 127.5f) * (1.0f / 127.5f);
         const int p = M.scopePtr[i].load(std::memory_order_relaxed);
@@ -522,8 +597,7 @@ private:
         const int64_t wtStart = GRAIN_START[lane] + (mut > 0 ? int64_t(rnd() * mut * 8000.0f) : 0);
         float mean = 0;
         for (int j = 0; j < WT_N; ++j) {
-            float v = 0;
-            for (int k = 0; k < 4; ++k) v += c.w[k] * float(sample(c.idx[k], wtStart + j));
+            const float v = blendByte(c, wtStart + j, P.blend.load());
             g->wt[j] = v;
             mean += v;
         }

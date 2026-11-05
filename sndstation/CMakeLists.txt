@@ -35,6 +35,11 @@ target_compile_options(test_bytebeat PRIVATE -Wall -Wextra)
 add_executable(test_free test_free.cpp)
 target_compile_options(test_free PRIVATE -Wall -Wextra)
 
+# The blend must choose a real byte, never invent one.
+add_executable(test_blend test_blend.cpp)
+target_compile_options(test_blend PRIVATE -Wall -Wextra)
+
 enable_testing()
 add_test(NAME bytebeat COMMAND test_bytebeat)
 add_test(NAME free COMMAND test_free)
+add_test(NAME blend COMMAND test_blend)
