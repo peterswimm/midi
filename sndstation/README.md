@@ -241,29 +241,48 @@ processor: every `Math` name in scope as a bare name, `int` as `Math.trunc`,
 `window` as the global. A song written `sin(t)` depends on that, so a reference
 run without it would be testing the wrong language.
 
-From the archive as it stood on 2026-11-05, that is **810 songs by 232
+From the archive as it stood on 2026-11-05, that is **863 songs by 232
 authors**, out of 1112 that carry their code inline. Honestly, where the rest
 go:
 
 | | |
 |---|---|
 | 894 | no inline code in the index — they live as separate files on the server |
-| 260 | past this evaluator's grammar |
+| 198 | past this evaluator's grammar |
 | 76 | stereo (a two-element return); the map is mono |
-| 30 | render differently from node, so dropped on principle |
+| 39 | render differently from node, so dropped on principle |
 | 12 | node itself will not run them |
 | 6 | truncated in the index |
 | 3 | Funcbeat — statements, a different language |
 
 The grammar is expressions, not statements: the operators with JavaScript's
-coercions, `Math` under both its bare and qualified names, binary and octal
-literals, lookup tables whose elements are themselves expressions (holes
-included), strings via `[i]` and `.charCodeAt(i)`, the ternary, named local
-variables in a frame that starts fresh each sample, and arrow functions with
-default parameters — which is how a song carries one voice and plays it at
-several pitches. What remains out is host objects (`Array`, `parseInt`,
-`.length`), arrays held in variables rather than written in place, and function
-bodies made of statements.
+coercions, `Math` under both its bare and qualified names (and under any name a
+song gives it — `C = cos` then `C(x)`), decimal, hex, binary and octal
+literals, lookup tables whose elements are themselves expressions and which may
+be held in a variable, `.length`, strings via `[i]`, `.charCodeAt(i)` and
+`parseInt(s[i], 16)`, escapes included, the ternary, named local variables, and
+arrow functions with default parameters — which is how a song carries one voice
+and plays it at several pitches.
+
+### Why the last two hundred cannot be played
+
+Nearly all of what remains is one thing: songs that keep **state between
+samples** — a delay line or reverb buffer made with `Array(n).fill(0)`, a
+counter hung off `this`, a global that accumulates. They are not missing a
+feature, they are asking for a different machine.
+
+A node here has to be a **pure function of `t`**. The blend samples it at the
+tick it needs, the wavetable grains read a window starting wherever a hit
+lands, the scope reads back whatever it likes, and a free lane runs at its own
+rate — nothing walks `t` from zero in order. A song with a buffer only has a
+defined value if you have already played every sample before it. Supporting
+that would mean giving up the purity the blend and the destinations both rest
+on, to play a couple of hundred songs that would then sound different depending
+on where you had been first. It is a real boundary rather than an unfinished
+edge, which is why the count stops here.
+
+The smaller remainder is object literals, spread, `eval`, and function bodies
+made of statements.
 
 `random()` is the one place this port deliberately departs from the composer.
 True randomness would make a song sound different on every pass, which breaks
@@ -295,7 +314,7 @@ change rewrite the patterns under you would make the map unnavigable, and a
 free lane bypasses the sequencer anyway, which is where a loaded song has the
 most to say.
 
-Interpreting costs a few times what the built-ins do — 1.6% of one core for
+Interpreting costs a few times what the built-ins do — 1.7% of one core for
 three lanes against 0.3% — which is still nothing on a handheld.
 
 ## Building

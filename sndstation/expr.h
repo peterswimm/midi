@@ -74,9 +74,10 @@ enum : uint8_t {
 enum : uint8_t {
     F1_SIN, F1_COS, F1_TAN, F1_ASIN, F1_ACOS, F1_ATAN, F1_FLOOR, F1_CEIL,
     F1_ROUND, F1_ABS, F1_SQRT, F1_CBRT, F1_LOG, F1_LOG2, F1_LOG10, F1_EXP,
-    F1_SIGN, F1_TRUNC
+    F1_SIGN, F1_TRUNC, F1_SINH, F1_COSH, F1_TANH, F1_ASINH, F1_ACOSH,
+    F1_ATANH, F1_EXPM1, F1_LOG1P, F1_FROUND, F1_CLZ32, F1_ISNAN
 };
-enum : uint8_t { F2_POW, F2_ATAN2 };
+enum : uint8_t { F2_POW, F2_ATAN2, F2_IMUL };
 enum : uint8_t { FN_MIN, FN_MAX, FN_HYPOT };
 
 // ── `random()`, made reproducible ──
@@ -92,6 +93,19 @@ enum : uint8_t { FN_MIN, FN_MAX, FN_HYPOT };
 // on every pass and in both evaluators. The song gets the noise it asked for
 // and we can still prove we are playing it right. This is a deliberate
 // divergence from the composer, and the only one in the language.
+// One character read as a number: its digit value in `radix`, with the two
+// quirks JavaScript insists on -- a space is 0 in base 10 (`Number(" ")`), and
+// anything that is not a digit of that base is NaN.
+inline double charDigit(char c, int radix) {
+    if (radix == 10 && c == ' ') return 0.0;
+    int d = -1;
+    if (c >= '0' && c <= '9') d = c - '0';
+    else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
+    if (d < 0 || d >= radix) return std::nan("");
+    return double(d);
+}
+
 inline double jsRandom(uint32_t t0, uint32_t& rc) {
     uint32_t h = t0 ^ (rc++ * 0x9E3779B1u);
     h = (h ^ (h >> 16)) * 0x85EBCA6Bu;
@@ -119,6 +133,8 @@ public:
         int32_t a = -1, b = -1, c = -1; // children
         int32_t ti = 0, tn = 0;         // table span, for OP_TABLE
         bool    str = false;            // ... and whether it was a string
+        bool    bound = false;          // ... and whether a variable holds it
+        uint8_t conv  = 0;              // radix a string element is read in; 0 = raw code
         double  k  = 0;                 // literal, for OP_K
         int32_t arg[MAX_ARGS]{};
         int32_t slot = -1;              // for OP_VAR / OP_ASSIGN
@@ -129,7 +145,7 @@ public:
     bool compile(const char* src) {
         m_src = src; m_p = src; m_nn = 0; m_nk = 0; m_depth = 0; m_nslot = 1;
         m_nf = 0;
-        for (int i = 0; i < MAX_SLOTS; ++i) m_fnOf[i] = -1;
+        for (int i = 0; i < MAX_SLOTS; ++i) { m_fnOf[i] = -1; m_tblOf[i] = -1; m_biOf[i] = -1; }
         std::memset(m_slotName, 0, sizeof m_slotName);
         std::snprintf(m_slotName[0], sizeof m_slotName[0], "t");
         m_err[0] = 0;
@@ -142,7 +158,7 @@ public:
         // through its string form. Catch it here: left unchecked it is a read
         // one slot before the node pool.
         for (int i = 0; i < m_nn; ++i)
-            if (m_pool[i].op == OP_TABLE && m_pool[i].a < 0) {
+            if (m_pool[i].op == OP_TABLE && m_pool[i].a < 0 && !m_pool[i].bound) {
                 fail("a table must be indexed"); return false;
             }
         m_root = root;
@@ -185,6 +201,8 @@ private:
     Func   m_func[MAX_FUNCS];
     int    m_nf = 0;
     int    m_fnOf[MAX_SLOTS]{};   // which function a name holds, -1 for none
+    int    m_tblOf[MAX_SLOTS]{};  // which table a name holds, -1 for none
+    int    m_biOf[MAX_SLOTS]{};   // which Math function a name aliases, -1 none
     char   m_slotName[MAX_SLOTS][12]{};
     int    m_nslot = 1;                 // slot 0 is `t`
     const char* m_src = nullptr;
@@ -241,6 +259,16 @@ private:
                     // for a voice or an envelope they then call at several
                     // pitches, which is most of what is left in the archive.
                     if (cop == 0xFF) {
+                        // `C = cos, S = sin` -- a name for a built-in, which
+                        // the song then calls as `C(x)`.
+                        const int bi = tryBuiltinAlias();
+                        if (bi >= 0) {
+                            m_biOf[slotOf(cond)] = bi;
+                            const int nd7 = alloc(OP_K);
+                            if (nd7 < 0) return -1;
+                            m_pool[nd7].k = std::nan("");
+                            return nd7;
+                        }
                         const int fi = tryArrow();
                         if (fi == -2) return -1;
                         if (fi >= 0) {
@@ -253,6 +281,18 @@ private:
                     }
                     const int rhs = parseExpr(1);
                     if (rhs < 0) return -1;
+                    // `s = [.5,.4,.3]` binds a table to a name, which the song
+                    // then indexes as `s[i]` and measures as `s.length`. The
+                    // binding is resolved at compile time -- there is still no
+                    // array value at runtime, only a span of elements.
+                    if (cop == 0xFF && m_pool[rhs].op == OP_TABLE && m_pool[rhs].a < 0) {
+                        m_tblOf[slotOf(cond)] = rhs;
+                        m_pool[rhs].bound = true;
+                        const int nd3 = alloc(OP_K);
+                        if (nd3 < 0) return -1;
+                        m_pool[nd3].k = std::nan("");   // an array, used as a number
+                        return nd3;
+                    }
                     int val = rhs;
                     if (cop != 0xFF) {                  // a compound assignment
                         const int src2 = alloc(OP_VAR);
@@ -379,6 +419,36 @@ private:
         return fi;
     }
 
+    // A bare Math name used as a value rather than called. Returns a packed
+    // kind and index, or -1 if what follows is not one.
+    int tryBuiltinAlias() {
+        const char* save = m_p;
+        skip();
+        const char* b = m_p;
+        if (std::strncmp(m_p, "Math.", 5) == 0) m_p += 5;
+        const char* b2 = m_p;
+        while (isIdent(*m_p)) ++m_p;
+        const int n2 = int(m_p - b2);
+        const char* after = m_p; while (*after == ' ') ++after;
+        if (n2 == 0 || *after == '(') { m_p = save; (void)b; return -1; }
+        const auto is2 = [&](const char* w) {
+            return int(std::strlen(w)) == n2 && std::strncmp(b2, w, size_t(n2)) == 0;
+        };
+        struct { const char* n; int kind; int idx; } T[] = {
+            {"sin", 1, F1_SIN}, {"cos", 1, F1_COS}, {"tan", 1, F1_TAN},
+            {"abs", 1, F1_ABS}, {"floor", 1, F1_FLOOR}, {"ceil", 1, F1_CEIL},
+            {"round", 1, F1_ROUND}, {"sqrt", 1, F1_SQRT}, {"exp", 1, F1_EXP},
+            {"log", 1, F1_LOG}, {"trunc", 1, F1_TRUNC}, {"int", 1, F1_TRUNC},
+            {"sign", 1, F1_SIGN}, {"tanh", 1, F1_TANH},
+            {"pow", 2, F2_POW}, {"atan2", 2, F2_ATAN2},
+            {"min", 3, FN_MIN}, {"max", 3, FN_MAX},
+        };
+        for (const auto& e : T)
+            if (is2(e.n)) return e.kind * 256 + e.idx;
+        m_p = save;
+        return -1;
+    }
+
     int slotOf(int node) const { return m_pool[node].op == OP_T ? 0 : m_pool[node].slot; }
 
     // `=` and the compound assignments. Returns 0xFF in `op` for a plain `=`,
@@ -471,16 +541,12 @@ private:
                 // `"6689"[1]` is the STRING "6", and a one-character string
                 // in arithmetic is its numeric VALUE, not its character code
                 // -- 6, not 54. (`charCodeAt` is the other one, below.) This
-                // is how a third of the archive writes a melody, so getting
-                // it wrong is not a corner case; it transposes the tune.
-                if (m_pool[lhs].str)
-                    for (int j = 0; j < m_pool[lhs].tn; ++j) {
-                        Node& kn = m_pool[m_elem[m_pool[lhs].ti + j]];
-                        const char ch2 = char(int(kn.k));
-                        kn.k = (ch2 >= '0' && ch2 <= '9') ? double(ch2 - '0')
-                             : (ch2 == ' ') ? 0.0           // Number(" ") is 0
-                             : std::nan("");                // Number("a") is NaN
-                    }
+                // is how a third of the archive writes a melody, so getting it
+                // wrong is not a corner case; it transposes the tune.
+                // The radix is recorded rather than baked into the elements,
+                // so two index sites on one string stay independent and
+                // parseInt can ask for base 16 over the same characters.
+                if (m_pool[lhs].str) m_pool[lhs].conv = 10;
                 ++m_p;
                 const int idx = parseExpr(0);
                 if (idx < 0) return -1;
@@ -541,6 +607,26 @@ private:
     }
 
     int parseNumber() {
+        // JavaScript has binary and octal literals; strtod reads neither, and
+        // stops at the `b`, leaving the digits behind as trailing text.
+        if (m_p[0] == '0' && (m_p[1] == 'b' || m_p[1] == 'B' ||
+                              m_p[1] == 'o' || m_p[1] == 'O')) {
+            const int base = (m_p[1] == 'b' || m_p[1] == 'B') ? 2 : 8;
+            const char* q = m_p + 2;
+            double bv = 0; int digits = 0;
+            for (; *q; ++q) {
+                if (*q == '_') continue;
+                const int d = (*q >= '0' && *q <= '9') ? *q - '0' : -1;
+                if (d < 0 || d >= base) break;
+                bv = bv * base + d; ++digits;
+            }
+            if (!digits) return fail("bad number"), -1;
+            m_p = q;
+            const int bn = alloc(OP_K);
+            if (bn < 0) return -1;
+            m_pool[bn].k = bv;
+            return bn;
+        }
         const char* end = nullptr;
         const double v = strtodc(m_p, &end);   // handles 0x.., 1e3, .5
         if (end == m_p) return fail("bad number"), -1;
@@ -592,11 +678,33 @@ private:
         const char q = *m_p++;
         const int base = m_nk;
         while (*m_p && *m_p != q) {
-            if (*m_p == '\\') return fail("escapes in strings are not supported"), -1;
+            int ch3 = uint8_t(*m_p++);
+            if (ch3 == '\\') {                     // an escape
+                const char e2 = *m_p++;
+                switch (e2) {
+                    case 'n': ch3 = '\n'; break;  case 't': ch3 = '\t'; break;
+                    case 'r': ch3 = '\r'; break;  case '0': ch3 = 0;    break;
+                    case 'x': case 'u': {
+                        const int w = (e2 == 'x') ? 2 : 4;
+                        int v2 = 0;
+                        for (int k2 = 0; k2 < w; ++k2) {
+                            const char h2 = *m_p;
+                            const int d2 = (h2 >= '0' && h2 <= '9') ? h2 - '0'
+                                         : (h2 >= 'a' && h2 <= 'f') ? h2 - 'a' + 10
+                                         : (h2 >= 'A' && h2 <= 'F') ? h2 - 'A' + 10 : -1;
+                            if (d2 < 0) return fail("bad escape"), -1;
+                            v2 = v2 * 16 + d2; ++m_p;
+                        }
+                        ch3 = v2; break;
+                    }
+                    case 0: return fail("unterminated string"), -1;
+                    default: ch3 = uint8_t(e2); break;   // \\ \' \" and the rest
+                }
+            }
             if (m_nk >= MAX_ELEM) return fail("string too long"), -1;
             const int kn = alloc(OP_K);
             if (kn < 0) return -1;
-            m_pool[kn].k = double(uint8_t(*m_p++));
+            m_pool[kn].k = double(ch3);
             m_elem[m_nk++] = kn;
         }
         if (*m_p != q) return fail("unterminated string"), -1;
@@ -631,6 +739,32 @@ private:
             m_pool[nd].k = kv;
             return nd;
         }
+        // `parseInt(s[i], 16)` is how a song packs a hex pattern into a
+        // string, and `parseInt(x)` on a number is its truncation. The first
+        // is folded into the index site's radix; the second is `trunc`.
+        if (is("parseInt")) {
+            if (!eat("(")) return fail("expected '('"), -1;
+            const int a4 = parseExpr(1);
+            if (a4 < 0) return -1;
+            int radix = 10;
+            if (eat(",")) {
+                const int r4 = parseExpr(1);
+                if (r4 < 0) return -1;
+                if (m_pool[r4].op != OP_K) return fail("parseInt needs a constant radix"), -1;
+                radix = int(m_pool[r4].k);
+                if (radix < 2 || radix > 36) return fail("bad radix"), -1;
+            }
+            if (!eat(")")) return fail("expected ')'"), -1;
+            if (m_pool[a4].op == OP_TABLE && m_pool[a4].str && m_pool[a4].a >= 0) {
+                m_pool[a4].conv = uint8_t(radix);
+                return a4;
+            }
+            if (radix != 10) return fail("parseInt needs a string in that radix"), -1;
+            const int nd6 = alloc(OP_F1);
+            if (nd6 < 0) return -1;
+            m_pool[nd6].fi = F1_TRUNC; m_pool[nd6].a = a4;
+            return nd6;
+        }
         if (is("random")) {
             if (!eat("(")) return fail("expected '('"), -1;
             if (!eat(")")) return fail("random takes no arguments"), -1;
@@ -648,11 +782,18 @@ private:
         else if (is("log10")) f1 = F1_LOG10; else if (is("exp"))   f1 = F1_EXP;
         else if (is("sign"))  f1 = F1_SIGN;  else if (is("trunc")) f1 = F1_TRUNC;
         else if (is("int"))   f1 = F1_TRUNC;      // the header's `var int = Math.trunc`
+        else if (is("sinh"))  f1 = F1_SINH;   else if (is("cosh"))  f1 = F1_COSH;
+        else if (is("tanh"))  f1 = F1_TANH;   else if (is("asinh")) f1 = F1_ASINH;
+        else if (is("acosh")) f1 = F1_ACOSH;  else if (is("atanh")) f1 = F1_ATANH;
+        else if (is("expm1")) f1 = F1_EXPM1;  else if (is("log1p")) f1 = F1_LOG1P;
+        else if (is("fround"))f1 = F1_FROUND; else if (is("clz32")) f1 = F1_CLZ32;
+        else if (is("isNaN")) f1 = F1_ISNAN;
         else has1 = false;
 
         uint8_t f2 = 0; bool has2 = true;
         if      (is("pow"))   f2 = F2_POW;
         else if (is("atan2")) f2 = F2_ATAN2;
+        else if (is("imul"))  f2 = F2_IMUL;
         else has2 = false;
 
         uint8_t fn = 0; bool hasN = true;
@@ -669,7 +810,7 @@ private:
             // songs name theirs `sine` and `tension` as readily as `a`.
             if (n >= int(sizeof m_slotName[0])) return fail("name too long"), -1;
             skip();
-            if (*m_p == '.') return fail("unsupported property"), -1;
+            const bool prop = (*m_p == '.');
             char nm[12];
             const int ln = n < 11 ? n : 11;
             std::memcpy(nm, s, size_t(ln)); nm[ln] = 0;
@@ -681,7 +822,78 @@ private:
                 sl = m_nslot++;
                 std::snprintf(m_slotName[sl], sizeof m_slotName[sl], "%s", nm);
             }
+            if (prop) {
+                if (m_tblOf[sl] < 0) return fail("unsupported property"), -1;
+                if (std::strncmp(m_p, ".length", 7) == 0) {
+                    m_p += 7;
+                    const int nd4 = alloc(OP_K);
+                    if (nd4 < 0) return -1;
+                    m_pool[nd4].k = double(m_pool[m_tblOf[sl]].tn);
+                    return nd4;
+                }
+                // `s.charCodeAt(i)` where a variable holds the string: hand
+                // back a table over the same elements and let parsePostfix
+                // attach the index, exactly as for a literal.
+                if (std::strncmp(m_p, ".charCodeAt", 11) == 0) {
+                    const Node& src3 = m_pool[m_tblOf[sl]];
+                    const int nd9 = alloc(OP_TABLE);
+                    if (nd9 < 0) return -1;
+                    m_pool[nd9].ti = src3.ti; m_pool[nd9].tn = src3.tn;
+                    m_pool[nd9].str = src3.str; m_pool[nd9].a = -1;
+                    return nd9;
+                }
+                return fail("unsupported property"), -1;
+            }
             skip();
+            if (*m_p == '[' && m_tblOf[sl] >= 0) {
+                // A fresh table node over the same elements, so parsePostfix
+                // attaches the index as it does to a literal. It must be a
+                // COPY: indexing a string rewrites its elements from character
+                // codes to numeric values, and two index sites on one string
+                // must not rewrite each other's.
+                const Node& src2 = m_pool[m_tblOf[sl]];
+                const int nd5 = alloc(OP_TABLE);
+                if (nd5 < 0) return -1;
+                m_pool[nd5].ti = src2.ti; m_pool[nd5].tn = src2.tn;
+                m_pool[nd5].str = src2.str;
+                m_pool[nd5].a = -1;
+                return nd5;
+            }
+            if (*m_p == '(' && m_fnOf[sl] < 0 && m_biOf[sl] >= 0) {
+                const int kind = m_biOf[sl] / 256, idx = m_biOf[sl] % 256;
+                ++m_p;
+                int a5[MAX_ARGS]; int na5 = 0;
+                if (peek() != ')') {
+                    for (;;) {
+                        if (na5 >= MAX_ARGS) return fail("too many arguments"), -1;
+                        const int e5 = parseExpr(1);
+                        if (e5 < 0) return -1;
+                        a5[na5++] = e5;
+                        if (eat(",")) continue;
+                        break;
+                    }
+                }
+                if (!eat(")")) return fail("expected ')'"), -1;
+                if (kind == 1) {
+                    if (na5 != 1) return fail("expected one argument"), -1;
+                    const int nd8 = alloc(OP_F1);
+                    if (nd8 < 0) return -1;
+                    m_pool[nd8].fi = uint8_t(idx); m_pool[nd8].a = a5[0];
+                    return nd8;
+                }
+                if (kind == 2) {
+                    if (na5 != 2) return fail("expected two arguments"), -1;
+                    const int nd8 = alloc(OP_F2);
+                    if (nd8 < 0) return -1;
+                    m_pool[nd8].fi = uint8_t(idx); m_pool[nd8].a = a5[0]; m_pool[nd8].b = a5[1];
+                    return nd8;
+                }
+                const int nd8 = alloc(OP_FN);
+                if (nd8 < 0) return -1;
+                m_pool[nd8].fi = uint8_t(idx); m_pool[nd8].n = uint8_t(na5);
+                for (int i = 0; i < na5; ++i) m_pool[nd8].arg[i] = a5[i];
+                return nd8;
+            }
             if (*m_p == '(') {
                 if (m_fnOf[sl] < 0) return fail("unsupported call"), -1;
                 ++m_p;
@@ -816,7 +1028,10 @@ private:
                 if (!(fi >= 0) || fi != std::floor(fi) || fi >= double(n.tn))
                     return std::nan("");          // `undefined` in arithmetic
                 const int32_t e = m_elem[n.ti + int(fi)];
-                return e < 0 ? std::nan("") : ev(e, f);   // a hole is undefined
+                if (e < 0) return std::nan("");           // a hole is undefined
+                const double raw = ev(e, f);
+                if (!n.conv) return raw;
+                return charDigit(char(int(raw)), n.conv);
             }
             case OP_F1: {
                 const double a = ev(n.a, f);
@@ -831,12 +1046,26 @@ private:
                     case F1_LOG2:  return std::log2(a);  case F1_LOG10:return std::log10(a);
                     case F1_EXP:   return std::exp(a);
                     case F1_SIGN:  return std::isnan(a) ? a : (a > 0 ? 1.0 : (a < 0 ? -1.0 : a));
+                    case F1_SINH:  return std::sinh(a);  case F1_COSH:  return std::cosh(a);
+                    case F1_TANH:  return std::tanh(a);  case F1_ASINH: return std::asinh(a);
+                    case F1_ACOSH: return std::acosh(a); case F1_ATANH: return std::atanh(a);
+                    case F1_EXPM1: return std::expm1(a); case F1_LOG1P: return std::log1p(a);
+                    case F1_FROUND:return double(float(a));
+                    case F1_CLZ32: {
+                        const uint32_t u = jsToUint32(a);
+                        if (!u) return 32;
+                        int c = 0; for (uint32_t m = 0x80000000u; !(u & m); m >>= 1) ++c;
+                        return double(c);
+                    }
+                    case F1_ISNAN: return std::isnan(a) ? 1.0 : 0.0;
                     default:       return std::trunc(a);
                 }
             }
             case OP_F2: {
                 const double a = ev(n.a, f), b = ev(n.b, f);
-                return n.fi == F2_POW ? std::pow(a, b) : std::atan2(a, b);
+                if (n.fi == F2_POW)   return std::pow(a, b);
+                if (n.fi == F2_ATAN2) return std::atan2(a, b);
+                return double(int32_t(jsToUint32(a) * jsToUint32(b)));   // Math.imul
             }
             default: {
                 if (n.fi == FN_HYPOT) {

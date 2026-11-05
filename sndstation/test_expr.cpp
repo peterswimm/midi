@@ -112,6 +112,30 @@ int main() {
     same("(x=5, f=x=>x*3, f(2)+x)",         11);    // the parameter does not leak
     same("(f=x=>x+1, g=y=>f(y)*2, g(4))",   10);    // nested calls
 
+    // tables held in variables, and measured
+    same("(a=[1,2,3], a[1]+a.length)",      5);
+    same("(s='abc', s.length)",             3);
+    same("(s='6689', s[2]*10)",             80);
+    same("(s='6689', s.charCodeAt(2))",     56);
+    // one string, two index sites, two radices -- neither may disturb the other
+    same("(s='8ea', parseInt(s[1],16)*100 + s[0])", 1408);
+    same("parseInt(7.9)",                   7);
+    same("parseInt(-7.9)",                  -7);
+
+    // a built-in under another name
+    same("(C=cos, C(0))",                   1);
+    same("(M=max, M(3,9,4))",               9);
+
+    // the rest of Math, and the literals
+    same("tanh(0)",                         0);
+    same("Math.imul(3,4)",                  12);
+    same("Math.imul(65535,65535)",          -131071);   // wraps at 32 bits
+    same("clz32(1)",                        31);
+    same("0b1011",                          11);
+    same("0o17",                            15);
+    same("\"\\x41\".charCodeAt(0)",            65);
+    check(std::isnan(ev("'z'[0]")), "a non-digit character is NaN in base 10");
+
     // what must be refused rather than guessed at
     Expr e;
     check(!e.compile("[1,2]"),           "an un-indexed table is refused");
@@ -119,9 +143,10 @@ int main() {
     check(!e.compile("window.foo"),      "a host object is refused");
     check(!e.compile("f=x=>{return 1}"),  "a statement body is refused");
     check(!e.compile("Array(8).fill(0)"), "a host call is refused");
+    check(!e.compile("this.v+1"),         "persistent state is refused");
 
     if (fails) return 1;
     std::printf("test_expr: 25 formulas agree with the hand port over 300000 ticks, "
-                "and 40 coercions, draws and calls match JavaScript\n");
+                "and 58 coercions, draws, calls and lookups match JavaScript\n");
     return 0;
 }
